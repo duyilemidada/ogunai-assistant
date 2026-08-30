@@ -1,0 +1,40 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+backend/venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+backend/**/__pycache__/
+
+# Database
+*.db
+*.db-journal
+backend/ogun.db
+
+# Runtime-generated directories (created automatically on server startup)
+workspace/
+uploads/
+ml_models/
+browser_sessions/
+
+# ML model files (regenerate via training scripts, don't commit binaries)
+*.pkl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Future frontend (once it exists)
+frontend/node_modules/
+frontend/dist/
