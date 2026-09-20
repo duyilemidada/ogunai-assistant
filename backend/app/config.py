@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://api.groq.com/openai/v1"
 
+
+    LLM_MAX_TOKENS: int = 800   # Cap per-response output tokens. Groq free tier
+                             # limits vary by model (some cap at 1000 OTPM) —
+                             # tune this per model in .env, not in code.
     #TAVILY
     TAVILY_API_KEY: str = ""
 

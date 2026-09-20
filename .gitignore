@@ -38,3 +38,4 @@ Thumbs.db
 # Future frontend (once it exists)
 frontend/node_modules/
 frontend/dist/
+frontend/.env.local

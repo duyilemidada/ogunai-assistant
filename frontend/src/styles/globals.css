@@ -1,0 +1,102 @@
+@import 'tailwindcss';
+@import './markdown.css';
+
+/*
+  Operator design system — warm palette with light/dark theming.
+  @theme inline: Tailwind generates utilities (bg-bg-base, text-primary, etc.)
+  that read from the CSS variables below. Swapping the variables swaps the theme.
+*/
+@theme inline {
+  --color-bg-base: var(--bg-base);
+  --color-bg-surface: var(--bg-surface);
+  --color-bg-elevated: var(--bg-elevated);
+  --color-bg-hover: var(--bg-hover);
+  --color-border: var(--border);
+
+  --color-primary: var(--primary);
+  --color-primary-dim: var(--primary-dim);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-muted: var(--text-muted);
+  --color-text-dim: var(--text-dim);
+
+  --color-success: var(--success);
+  --color-error: var(--error);
+  --color-warning: var(--warning);
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/* ── DARK THEME (default) — "Ember" ───────────────────────────────────── */
+:root,
+:root[data-theme='dark'] {
+  --bg-base: #17130f;
+  --bg-surface: #211b17;
+  --bg-elevated: #2b231e;
+  --bg-hover: #3a2f28;
+  --border: #3f352d;
+
+  --text-primary: #f5ede0;
+  --text-muted: #a89a87;
+  --text-dim: #6b5d4e;
+
+  --primary: #f58b36;
+  --primary-dim: #7c3a0a;
+  --accent: #6b8af8;
+  --accent-dim: #1e2a6e;
+
+  --success: #22c55e;
+  --error: #ef4444;
+  --warning: #f59e0b;
+}
+
+/* ── LIGHT THEME — "Parchment" ────────────────────────────────────────── */
+:root[data-theme='light'] {
+  --bg-base: #fbf8f3;
+  --bg-surface: #ffffff;
+  --bg-elevated: #f5efe6;
+  --bg-hover: #ede4d6;
+  --border: #e0d5c4;
+
+  --text-primary: #1a140e;
+  --text-muted: #6b5d4e;
+  --text-dim: #a89a87;
+
+  --primary: #d4661a;
+  --primary-dim: #f5e2d0;
+  --accent: #3d5ae0;
+  --accent-dim: #e0e5fb;
+
+  --success: #16a34a;
+  --error: #dc2626;
+  --warning: #d97706;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  margin: 0;
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+
+/* Thin scrollbars — themed */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--bg-hover);
+}

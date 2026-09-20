@@ -10,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from .database import create_tables, engine
 from .config import settings
 from .core.exceptions import OgunAIException
-from .routers import auth, chat
+from .routers import auth, chat, conversations, memory   # ← added conversations, memory
 from .services.agents.tools import get_embedder
 
 
@@ -19,10 +19,10 @@ async def lifespan(app: FastAPI):
     print(f"[Ogun AI] Starting — {settings.APP_NAME} v{settings.APP_VERSION}")
     create_tables()
     for dir_path, label in [
-        (settings.WORKSPACE_DIR,         "Workspace (run_terminal)"),
+        (settings.WORKSPACE_DIR,          "Workspace (run_terminal)"),
         (settings.PLAYWRIGHT_STORAGE_DIR, "Browser sessions (browse_authenticated)"),
-        (settings.UPLOADS_DIR,           "Uploads (upload_pdf)"),
-        (settings.ML_MODELS_DIR,         "ML models (XGBoost)"),
+        (settings.UPLOADS_DIR,            "Uploads (upload_pdf)"),
+        (settings.ML_MODELS_DIR,          "ML models (XGBoost)"),
     ]:
         os.makedirs(dir_path, exist_ok=True)
         print(f"[Ogun AI] {label}: {os.path.abspath(dir_path)}/")
@@ -52,12 +52,9 @@ async def ogunai_exception_handler(request: Request, exc: OgunAIException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # Pydantic validation errors can contain raw bytes when a file upload is sent
-    # to the wrong endpoint. json.dumps() raises TypeError on bytes, causing a 500.
-    # Recursively convert any non-serializable types to safe strings first.
     def make_serializable(obj):
         if isinstance(obj, bytes):
-            return f"<binary data, {len(obj)} bytes — did you mean to POST to /upload?>"
+            return f"<binary data, {len(obj)} bytes>"
         if isinstance(obj, dict):
             return {k: make_serializable(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -66,12 +63,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     return JSONResponse(
         status_code=422,
-        content={
-            "error": {
-                "code": "VALIDATION_ERROR",
-                "details": make_serializable(exc.errors())
-            }
-        }
+        content={"error": {"code": "VALIDATION_ERROR", "details": make_serializable(exc.errors())}}
     )
 
 
@@ -86,6 +78,8 @@ app.add_middleware(
 PREFIX = "/api/v1"
 app.include_router(auth.router, prefix=PREFIX)
 app.include_router(chat.router, prefix=PREFIX)
+app.include_router(conversations.router, prefix=PREFIX)   # ← new
+app.include_router(memory.router, prefix=PREFIX)            # ← new
 
 
 @app.get("/health")

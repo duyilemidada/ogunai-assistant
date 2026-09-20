@@ -19,14 +19,22 @@ class OgunAIAgent:
         llm_adapter=None,
         user_id: int = None,
         conversation_id: int = None,
+        history_messages: Optional[List[Dict[str, str]]] = None,
     ):
-        self.role_config   = role_config
-        self.llm           = llm_adapter if llm_adapter is not None else _global_adapter
-        self.user_id       = user_id
+        self.role_config     = role_config
+        self.llm             = llm_adapter if llm_adapter is not None else _global_adapter
+        self.user_id         = user_id
         self.conversation_id = conversation_id
         self.history: List[Dict] = [
             {"role": "system", "content": role_config["system_prompt"]}
         ]
+        if history_messages:
+            # Prior turns from this SAME conversation, loaded from the DB by
+            # chat.py, so the agent has continuity across separate HTTP
+            # requests. Without this, every message starts from zero —
+            # which is the exact bug behind "I don't remember what we
+            # discussed a moment ago" within one unbroken chat thread.
+            self.history.extend(history_messages)
 
     def _trim_history(self):
         if len(self.history) > MAX_HISTORY:
@@ -64,18 +72,15 @@ class OgunAIAgent:
             return {"error": f"{tool_name} failed: {e}"}
 
     def run(self, user_input: str, event_callback: Optional[Callable] = None) -> str:
-        """
-        ReAct loop. Returns the final text response.
-        If event_callback is provided, emits SSE-ready events at each step.
-        The callback is stored in thread-local storage so it propagates
-        automatically through delegate_to into sub-agents.
-        """
         if event_callback is not None:
             set_callback(event_callback)
 
         self.history.append({"role": "user", "content": user_input})
         tools    = get_tool_schemas(self.role_config["tools"])
         max_iter = self.role_config["max_iterations"]
+
+        seen_call_signatures: Dict[str, int] = {}
+        force_text_only_next = False
 
         try:
             for i in range(max_iter):
@@ -88,14 +93,16 @@ class OgunAIAgent:
                     "max_iterations": max_iter,
                 })
 
-                llm_response  = self.llm.invoke_with_tools(self.history, tools, temperature=0.4)
+                tools_for_this_call = [] if force_text_only_next else tools
+                force_text_only_next = False
+
+                llm_response  = self.llm.invoke_with_tools(self.history, tools_for_this_call, temperature=0.4)
                 text_response = llm_response.get("text", "")
                 tool_calls    = llm_response.get("tool_calls", [])
 
                 print(f"  THOUGHT    : {text_response[:200]!r}")
                 print(f"  TOOL CALLS : {[tc['name'] for tc in tool_calls]}")
 
-                # One tool per turn — parallel calls overflow the free-tier TPM limit
                 if len(tool_calls) > 1:
                     print(f"  [CAP] {len(tool_calls)} calls → first only.")
                     tool_calls = tool_calls[:1]
@@ -104,7 +111,6 @@ class OgunAIAgent:
                     emit_event("tool_call", {
                         "agent": self.role_config["name"],
                         "tool":  tool_calls[0]["name"],
-                        # Truncate args preview so large strings don't hit the SSE wire
                         "args":  {k: str(v)[:80] for k, v in tool_calls[0]["arguments"].items()},
                     })
 
@@ -125,13 +131,28 @@ class OgunAIAgent:
 
                 if not tool_calls:
                     emit_event("agent_done", {
-                        "agent":    self.role_config["name"],
-                        "preview":  text_response[:200],
+                        "agent":   self.role_config["name"],
+                        "preview": text_response[:200],
                     })
                     return text_response
 
                 for tc in tool_calls:
-                    result     = self._execute_tool(tc["name"], tc["arguments"])
+                    signature = f"{tc['name']}::{json.dumps(tc['arguments'], sort_keys=True, default=str)}"
+                    seen_call_signatures[signature] = seen_call_signatures.get(signature, 0) + 1
+
+                    if seen_call_signatures[signature] > 1:
+                        print(f"  [DEDUPE] Repeated identical call to {tc['name']} — blocking re-execution.")
+                        result = {
+                            "error": (
+                                "You already called this exact tool with these exact arguments earlier "
+                                "in this conversation. The result will not change — do not call it again. "
+                                "Answer the user's question now using the information already returned above."
+                            )
+                        }
+                        force_text_only_next = True
+                    else:
+                        result = self._execute_tool(tc["name"], tc["arguments"])
+
                     result_str = self._truncate_result(json.dumps(result, indent=2))
 
                     emit_event("tool_result", {
@@ -154,8 +175,6 @@ class OgunAIAgent:
             return text_response or "I reached the maximum number of steps without completing this task."
 
         finally:
-            # Only clear if this call set the callback (top-level agent).
-            # Sub-agents spawned by delegate_to should leave it in place.
             if event_callback is not None:
                 clear_callback()
 

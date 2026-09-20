@@ -1,0 +1,52 @@
+.prose-ogun {
+  font-size: 15px;
+  line-height: 1.7;
+}
+.prose-ogun p {
+  margin: 0 0 12px 0;
+}
+.prose-ogun p:last-child {
+  margin-bottom: 0;
+}
+.prose-ogun ul,
+.prose-ogun ol {
+  margin: 0 0 12px 0;
+  padding-left: 22px;
+}
+.prose-ogun li {
+  margin-bottom: 4px;
+}
+.prose-ogun h1,
+.prose-ogun h2,
+.prose-ogun h3,
+.prose-ogun h4 {
+  font-weight: 600;
+  margin: 20px 0 10px 0;
+  color: var(--color-text-primary);
+}
+.prose-ogun h1 {
+  font-size: 1.4em;
+}
+.prose-ogun h2 {
+  font-size: 1.25em;
+}
+.prose-ogun h3 {
+  font-size: 1.1em;
+}
+.prose-ogun h4 {
+  font-size: 1em;
+}
+.prose-ogun strong {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.prose-ogun blockquote {
+  border-left: 3px solid var(--color-border);
+  padding-left: 12px;
+  color: var(--color-text-muted);
+  margin: 12px 0;
+}
+.prose-ogun hr {
+  border-color: var(--color-border);
+  margin: 16px 0;
+}

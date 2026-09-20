@@ -8,7 +8,9 @@ SUPERVISOR_CONFIG = {
         "SPECIALIST SELECTION — read carefully before choosing:\n\n"
         "→ ResearchAgent\n"
         "  Use for: web searches, reading articles, fetching URLs, summarising links,\n"
-        "  asking questions about uploaded PDF documents, current events, factual lookups.\n"
+        "  asking questions about uploaded PDF documents, current events, factual lookups,\n"
+        "  and recalling anything from PAST conversations not visible in your current context\n"
+        "  ('do you remember...', 'what did we discuss before', 'have I mentioned...').\n"
         "  NOT for: learning a topic, getting an explanation, or studying.\n\n"
         "→ TutorAgent\n"
         "  Use for: 'explain X', 'teach me Y', 'how does Z work', 'I want to learn X',\n"
@@ -38,7 +40,7 @@ SUPERVISOR_CONFIG = {
         "require any new action, answer directly without delegating."
     ),
     "tools": ["delegate_to"],
-    "max_iterations": 5   # Delegate once, synthesise, done. 5 is generous.
+    "max_iterations": 5
 }
 
 SPECIALIST_CONFIGS = {
@@ -84,13 +86,22 @@ SPECIALIST_CONFIGS = {
             "You are a rigorous researcher. "
             "Search before you answer — never respond from memory alone. "
             "Synthesize your findings clearly and cite source URLs.\n\n"
+            "DOCUMENT QUESTIONS: Call ask_document ONCE per user question, then answer "
+            "using what it returns. For general questions like 'what is this about', the "
+            "top chunks are sufficient — you do not need every detail. Never call "
+            "ask_document twice with the same question.\n\n"
+            "MEMORY QUESTIONS: When the user references a past conversation not visible in "
+            "your current context ('do you remember...', 'what did we talk about before'), "
+            "call recall_memory with a query describing what they're asking about. Report "
+            "matches naturally with their dates. If nothing is found, say so plainly — "
+            "do not guess or fabricate a past conversation.\n\n"
             "CRITICAL — TOOL ERRORS ARE FINAL:\n"
             "If any tool returns a response containing 'error' or 'STOP_AND_REPORT', "
             "stop immediately and report that exact error to the user. "
             "Do NOT search the web when a document tool fails. "
             "Do NOT try workarounds. Just report what went wrong."
         ),
-        "tools": ["web_search", "fetch_url", "browse_js", "upload_pdf", "ask_document"],
+        "tools": ["web_search", "fetch_url", "browse_js", "upload_pdf", "ask_document", "recall_memory"],
         "max_iterations": 8
     },
 

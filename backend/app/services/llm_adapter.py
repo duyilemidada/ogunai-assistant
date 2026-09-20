@@ -12,7 +12,7 @@ class BaseLLMAdapter(ABC):
         messages: List[Dict],
         tools: List[Dict],
         temperature: float = 0.4,
-        tool_choice: str = "auto"       # ← new parameter
+        tool_choice: str = "auto"
     ) -> Dict[str, Any]:
         pass
 
@@ -36,7 +36,6 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
         temperature: float = 0.4,
         tool_choice: str = "auto"
     ) -> Dict[str, Any]:
-        # If there are no tools, ignore tool_choice entirely
         effective_tool_choice = tool_choice if tools else None
 
         for attempt in (1, 2):
@@ -45,6 +44,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                     model=self.model,
                     messages=messages,
                     temperature=temperature,
+                    max_tokens=settings.LLM_MAX_TOKENS,   # ← caps output, avoids OTPM 429s
                     tools=tools if tools else None,
                     tool_choice=effective_tool_choice
                 )
@@ -69,16 +69,10 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                 err = str(e)
                 print(f"[LLM ADAPTER] Attempt {attempt} failed: {err[:300]}")
                 if attempt == 1 and "tool_use_failed" in err:
-                    # Malformed tool call — nudge and retry once.
-                    # Switch to "auto" on retry so the model can choose to answer
-                    # directly if it still can't form a valid call.
                     effective_tool_choice = "auto"
                     messages = messages + [{
                         "role": "user",
-                        "content": (
-                            "Your previous tool call was malformed. "
-                            "Use the exact JSON schema provided — no other format."
-                        )
+                        "content": "Your previous tool call was malformed. Use the exact JSON schema provided — no other format."
                     }]
                     continue
                 return {"text": f"LLM error: {e}", "tool_calls": []}

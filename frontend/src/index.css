@@ -1,0 +1,54 @@
+@import 'tailwindcss';
+
+/*
+  Tailwind v4 @theme block: every --color-* variable here automatically
+  becomes a utility class. --color-primary generates bg-primary,
+  text-primary, border-primary, etc. — no config file needed.
+  Values match the "Operator" design system from the frontend spec.
+*/
+@theme {
+  --color-bg-base: #0b0d14;
+  --color-bg-surface: #141720;
+  --color-bg-elevated: #1c2030;
+  --color-bg-hover: #242840;
+  --color-border: #2d3350;
+
+  --color-primary: #e87b2b; /* Ogun amber-fire — agent/system state */
+  --color-primary-dim: #7c3a0a;
+  --color-accent: #4f6ef5; /* User-actionable — links, buttons */
+  --color-accent-dim: #1e2a6e;
+
+  --color-text-primary: #e8eaf2;
+  --color-text-muted: #6b7a99;
+  --color-text-dim: #3d4a6b;
+
+  --color-success: #22c55e;
+  --color-error: #ef4444;
+  --color-warning: #f59e0b;
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+body {
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  margin: 0;
+}
+
+/* Thin, dark-mode-friendly scrollbars — matches the Operator aesthetic */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-bg-hover);
+}

@@ -19,7 +19,7 @@ from ...config import settings
 from ...database import SessionLocal
 from ...models import (
     UserLike, DailyNutrition, WorkoutLog, PhysicalStatus,
-    Document, DocumentChunk, LearningProgress
+    Document, DocumentChunk, LearningProgress, ConversationMemory
 )
 
 
@@ -95,6 +95,123 @@ def get_embedder() -> SentenceTransformer:
 
 
 # ─── Async helper (Crawl4AI runs async; our tools are sync) ──────────────────
+
+def generate_conversation_title(user_message: str, agent_response: str) -> str:
+    """
+    Generates a short, descriptive conversation title from the first exchange.
+    Uses a separate, tool-free LLM call — cheap and fast since there's no
+    tool schema overhead and the prompt is tiny. Falls back to a truncated
+    user message if the LLM call fails for any reason, so a title is always
+    produced even if this optional step breaks.
+    """
+    from ..llm_adapter import llm_adapter
+
+    prompt = (
+        "Generate a short title (4-6 words max) for this conversation. "
+        "No quotes, no punctuation at the end, no prefix like 'Title:'. "
+        "Just the title text itself.\n\n"
+        f"User: {user_message[:300]}\n"
+        f"Assistant: {agent_response[:300]}"
+    )
+
+    try:
+        response = llm_adapter.invoke_with_tools(
+            messages=[{"role": "user", "content": prompt}],
+            tools=[],              # no tools — forces a plain text answer
+            temperature=0.3,       # low temperature — titles should be consistent, not creative
+            tool_choice="auto"
+        )
+        title = response.get("text", "").strip().strip('"').strip("'")
+        if title and len(title) <= 80:
+            return title
+    except Exception as e:
+        print(f"[Title Generation] Failed: {e}")
+
+    # Fallback — the old behaviour, only used if the LLM call above fails
+    return user_message[:50]
+
+# ─── Cross-Conversation Memory ─────────────────────────────────────────────────
+
+def store_conversation_memory(user_id: int, conversation_id: int, user_message: str, agent_response: str) -> None:
+    """
+    Embeds and stores one completed exchange for future recall via recall_memory.
+    Called automatically by chat.py after every turn — never called by the LLM
+    itself. Store everything; recall_memory decides what's relevant later.
+    """
+    db = SessionLocal()
+    try:
+        combined = f"User: {user_message}\nOgun: {agent_response}"
+        emb = get_embedder().encode(combined[:2000]).astype(np.float32)
+
+        db.add(ConversationMemory(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            summary=combined[:1500],
+            embedding=emb.tobytes()
+        ))
+        db.commit()
+    except Exception as e:
+        print(f"[Memory] Failed to store conversation memory: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+@register_tool("recall_memory")
+def recall_memory(query: str, user_id: int) -> Dict[str, Any]:
+    """
+    Searches every past conversation (across all sessions, not just this one)
+    for exchanges related to the query. Use when the user references something
+    from an earlier conversation not visible in the current context —
+    'do you remember...', 'what did we discuss last week', 'have I mentioned...'.
+    """
+    db = SessionLocal()
+    try:
+        entries = db.query(ConversationMemory).filter(
+            ConversationMemory.user_id == user_id
+        ).all()
+
+        if not entries:
+            return {"found": False, "message": "No past conversation history has been recorded yet."}
+
+        q_emb = get_embedder().encode(query).astype(np.float32)
+        scored = []
+        for entry in entries:
+            e_emb = np.frombuffer(entry.embedding, dtype=np.float32)
+            norm = np.linalg.norm(q_emb) * np.linalg.norm(e_emb)
+            sim = float(np.dot(q_emb, e_emb) / norm) if norm > 0 else 0.0
+            scored.append((sim, entry))
+
+        # A note on scale: this is a plain Python loop over every stored
+        # exchange, same pattern as ask_document. Fine for years of
+        # personal-scale use (thousands of rows). If this ever grows past
+        # tens of thousands of entries, sqlite-vec would speed the scan up —
+        # not needed at anything close to current scale.
+        top = sorted(scored, key=lambda x: x[0], reverse=True)[:5]
+        relevant = [
+            {
+                "date": entry.created_at.strftime("%Y-%m-%d"),
+                "similarity": round(sim, 3),
+                "exchange": entry.summary[:400],
+            }
+            for sim, entry in top
+            if sim > 0.25
+        ]
+
+        if not relevant:
+            return {"found": False, "message": "Nothing in past conversations closely matches this."}
+
+        return {
+            "found": True,
+            "matches": relevant,
+            "instruction": (
+                "These are real excerpts from past conversations with this user. "
+                "Answer naturally, e.g. 'Yes, on [date] we discussed...'. "
+                "Do not add details beyond what's shown here."
+            )
+        }
+    finally:
+        db.close()
 
 def _run_async(coro):
     """
@@ -1106,6 +1223,8 @@ def ask_document(document_id: int, question: str, user_id: int) -> Dict[str, Any
     """
     Answers a question using ONLY content from an uploaded document (grounded RAG).
     Use after upload_pdf. Always cite the page number in your answer.
+    Call this ONCE per question — the result is deterministic and calling it
+    again with the same question returns the same chunks.
     document_id: from upload_pdf response. question: what you want to know.
     """
     db = SessionLocal()
@@ -1116,8 +1235,6 @@ def ask_document(document_id: int, question: str, user_id: int) -> Dict[str, Any
         ).first()
 
         if not document:
-            # Use STOP_AND_REPORT so the agent prompt can match this signal
-            # and return immediately without attempting workarounds.
             return {
                 "STOP_AND_REPORT": True,
                 "error": (
@@ -1147,13 +1264,17 @@ def ask_document(document_id: int, question: str, user_id: int) -> Dict[str, Any
             sim = float(np.dot(q_emb, c_emb) / norm) if norm > 0 else 0.0
             scored.append((sim, chunk))
 
-        top = sorted(scored, key=lambda x: x[0], reverse=True)[:5]
+        # Top 3 (was 5) — fewer chunks per call keeps token cost predictable
+        # and reduces the chance of hitting free-tier ITPM limits.
+        top = sorted(scored, key=lambda x: x[0], reverse=True)[:3]
         relevant = [
             {
                 "page": c.page_number,
-                "chunk_index": c.chunk_index,
                 "similarity": round(sim, 3),
-                "text": c.text
+                # Capped at 500 chars (was full chunk, ~800 chars) — enough
+                # context to answer general questions without ballooning
+                # the request size.
+                "text": c.text[:500]
             }
             for sim, c in top
             if sim > 0.1
@@ -1174,14 +1295,15 @@ def ask_document(document_id: int, question: str, user_id: int) -> Dict[str, Any
             "question": question,
             "relevant_chunks": relevant,
             "instruction": (
-                "Answer ONLY using the text in relevant_chunks above. "
-                "For every claim, cite the page number in parentheses e.g. (p.3). "
-                "If the chunks don't contain enough information to answer fully, say so explicitly."
+                "This is enough context to answer. Answer ONLY using the text in "
+                "relevant_chunks above. For every claim, cite the page number in "
+                "parentheses e.g. (p.3). Do not call ask_document again for this question — "
+                "if these chunks don't fully cover it, say what's missing rather than "
+                "re-querying with the same question."
             )
         }
     finally:
         db.close()
-
 # ─── Fitness: Private Helpers ─────────────────────────────────────────────────
 
 def _build_injury_features(user_id: int):
