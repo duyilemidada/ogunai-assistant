@@ -36,18 +36,28 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
         temperature: float = 0.4,
         tool_choice: str = "auto"
     ) -> Dict[str, Any]:
-        effective_tool_choice = tool_choice if tools else None
+        effective_tool_choice = tool_choice
 
         for attempt in (1, 2):
             try:
-                response = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=settings.LLM_MAX_TOKENS,   # ← caps output, avoids OTPM 429s
-                    tools=tools if tools else None,
-                    tool_choice=effective_tool_choice
-                )
+                # Build the request, adding tool fields ONLY when there are tools.
+                # The OpenAI SDK sends an explicitly-passed None as JSON null
+                # ("tool_choice": null, "tools": null), and Groq rejects that with
+                # "Only allowed string values for 'tool_choice'". Omitting the keys
+                # entirely is what a plain-text request (no tools) needs. This is
+                # the path used for conversation titles and the forced-text-answer
+                # step of the duplicate-call guard.
+                request: Dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": settings.LLM_MAX_TOKENS,   # caps output, avoids OTPM 429s
+                }
+                if tools:
+                    request["tools"] = tools
+                    request["tool_choice"] = effective_tool_choice
+
+                response = self._client.chat.completions.create(**request)
                 msg = response.choices[0].message
                 tool_calls = []
 
