@@ -190,3 +190,22 @@ class ConversationMemory(Base):
     summary = Column(Text, nullable=False)           # capped exchange text
     embedding = Column(LargeBinary, nullable=False)  # float32 bytes, 384 dims
     created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+
+class PendingAction(Base):
+    """
+    Approval ledger. A consequential action (a transfer, a shell command after
+    the request read external content, a GitHub write) is recorded here first.
+    It only becomes runnable when the USER's own chat message approves it,
+    and each approval can be used once. See services/agents/guards.py.
+    """
+    __tablename__ = "pending_actions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=True, index=True)
+    tool_name = Column(String, nullable=False)          # tool this entry authorises
+    args = Column(JSON, nullable=False)                 # the exact arguments proposed
+    summary = Column(Text, nullable=True)               # human-readable description
+    status = Column(String, nullable=False, default="pending")  # pending|approved|consumed|cancelled
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    approved_at = Column(DateTime, nullable=True)
+    consumed_at = Column(DateTime, nullable=True)

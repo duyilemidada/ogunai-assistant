@@ -5,6 +5,10 @@ from typing import Dict, Any, List, Optional, Callable
 from ..llm_adapter import llm_adapter as _global_adapter
 from .tools import get_tool_schemas, _TOOL_REGISTRY
 from .events import emit_event, set_callback, clear_callback
+from .guards import (
+    TAINTING_TOOLS, set_turn_context, get_turn_context, clear_turn_context,
+    mark_tainted, gate_tool_call, render_tool_result,
+)
 from ...database import SessionLocal
 from ...models import Episode
 
@@ -30,23 +34,26 @@ class OgunAIAgent:
         ]
         if history_messages:
             # Prior turns from this SAME conversation, loaded from the DB by
-            # chat.py, so the agent has continuity across separate HTTP
-            # requests. Without this, every message starts from zero —
-            # which is the exact bug behind "I don't remember what we
-            # discussed a moment ago" within one unbroken chat thread.
+            # chat.py, so the agent has continuity across separate requests.
             self.history.extend(history_messages)
 
     def _trim_history(self):
-        if len(self.history) > MAX_HISTORY:
-            self.history = self.history[:1] + self.history[-(MAX_HISTORY - 1):]
+        """
+        Keep the system prompt plus the most recent messages.
 
-    def _truncate_result(self, result_str: str) -> str:
-        if len(result_str) <= MAX_RESULT_CHARS:
-            return result_str
-        return (
-            result_str[:MAX_RESULT_CHARS]
-            + f"\n... [truncated — {len(result_str) - MAX_RESULT_CHARS} chars omitted]"
-        )
+        The system prompt (index 0) always survives. The subtle part: a 'tool'
+        message is only valid directly after the assistant message that asked
+        for it. If the cut lands between the two, the history would start with
+        an orphaned tool message and the API rejects the request with a 400.
+        So after cutting, drop any tool messages left at the front.
+        """
+        if len(self.history) <= MAX_HISTORY:
+            return
+        system = self.history[0]
+        tail = self.history[-(MAX_HISTORY - 1):]
+        while tail and tail[0].get("role") == "tool":
+            tail = tail[1:]
+        self.history = [system] + tail
 
     def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name not in self.role_config["tools"]:
@@ -64,6 +71,15 @@ class OgunAIAgent:
         if 'user_id' in func.__code__.co_varnames[:func.__code__.co_argcount]:
             args['user_id'] = self.user_id
 
+        # Code-level gate (see guards.py). Money movement, shell commands and
+        # GitHub writes only run if the user has approved them in their own
+        # chat message. This sits in front of the tool, so the model cannot
+        # bypass it by being persuaded, tricked, or by skipping a prompt rule.
+        decision = gate_tool_call(tool_name, args)
+        if not decision.allowed:
+            return decision.result
+        args = decision.args
+
         try:
             print(f"  [{self.role_config['name']}] → {tool_name}({list(args.keys())})")
             return func(**args)
@@ -72,17 +88,30 @@ class OgunAIAgent:
             return {"error": f"{tool_name} failed: {e}"}
 
     def run(self, user_input: str, event_callback: Optional[Callable] = None) -> str:
-        if event_callback is not None:
-            set_callback(event_callback)
+        """
+        ReAct loop. Returns the final text response.
 
-        self.history.append({"role": "user", "content": user_input})
-        tools    = get_tool_schemas(self.role_config["tools"])
-        max_iter = self.role_config["max_iterations"]
-
-        seen_call_signatures: Dict[str, int] = {}
-        force_text_only_next = False
-
+        The top-level agent (the Supervisor) opens the "turn context" that
+        tracks whether this request has read untrusted content. Specialists
+        started through delegate_to run in the same thread, see the same
+        context, and leave closing it to the agent that opened it.
+        """
+        owns_turn_context = False
+        text_response = ""
         try:
+            if event_callback is not None:
+                set_callback(event_callback)
+            if self.user_id is not None and get_turn_context() is None:
+                set_turn_context(self.user_id, self.conversation_id)
+                owns_turn_context = True
+
+            self.history.append({"role": "user", "content": user_input})
+            tools    = get_tool_schemas(self.role_config["tools"])
+            max_iter = self.role_config["max_iterations"]
+
+            seen_call_signatures: Dict[str, int] = {}
+            force_text_only_next = False
+
             for i in range(max_iter):
                 self._trim_history()
                 print(f"[{self.role_config['name']}] Iteration {i+1}/{max_iter}")
@@ -153,7 +182,10 @@ class OgunAIAgent:
                     else:
                         result = self._execute_tool(tc["name"], tc["arguments"])
 
-                    result_str = self._truncate_result(json.dumps(result, indent=2))
+                    # External content just entered the context: from here on,
+                    # shell commands and GitHub writes in this request need approval.
+                    if tc["name"] in TAINTING_TOOLS and "error" not in result:
+                        mark_tainted(tc["name"])
 
                     emit_event("tool_result", {
                         "agent":   self.role_config["name"],
@@ -162,14 +194,15 @@ class OgunAIAgent:
                         "preview": str(result)[:150],
                     })
 
+                    # Truncate, wrap as untrusted data, flag instruction-like text.
                     self.history.append({
                         "role":         "tool",
                         "tool_call_id": tc["id"],
                         "name":         tc["name"],
-                        "content":      result_str
+                        "content":      render_tool_result(tc["name"], result, MAX_RESULT_CHARS),
                     })
                     if self.conversation_id:
-                        self._log_episode(tc["name"], tc["arguments"], result)
+                        self._log_episode(tc["name"], tc["arguments"], result, reasoning=text_response)
 
             print(f"[{self.role_config['name']}] Hit max iterations ({max_iter})")
             return text_response or "I reached the maximum number of steps without completing this task."
@@ -177,15 +210,25 @@ class OgunAIAgent:
         finally:
             if event_callback is not None:
                 clear_callback()
+            if owns_turn_context:
+                clear_turn_context()
 
-    def _log_episode(self, action: str, metadata: Dict, result: Dict):
+    def _log_episode(self, action: str, metadata: Dict, result: Dict, reasoning: str = ""):
+        """
+        Audit trail of every tool call. The model's own reasoning text is
+        stored under '_reasoning' so that after an incident you can see not
+        just WHAT it did but what it was thinking when it did it.
+        """
         try:
             db = SessionLocal()
+            meta = dict(metadata)
+            if reasoning:
+                meta["_reasoning"] = reasoning[:500]
             db.add(Episode(
                 conversation_id=self.conversation_id,
                 agent_name=self.role_config["name"],
                 action=action,
-                meta_data=metadata,
+                meta_data=meta,
                 result=result,
                 feedback=None
             ))

@@ -17,6 +17,7 @@ from ..schemas import ChatRequest, MessageResponse
 from ..config import settings
 from ..services.agents.base import OgunAIAgent
 from ..services.agents.configs import SUPERVISOR_CONFIG
+from ..services.agents.guards import approve_latest_pending_if_confirmed
 from ..services.agents.tools import _process_pdf, store_conversation_memory, generate_conversation_title
 
 router  = APIRouter(prefix="/chat", tags=["Chat"])
@@ -100,6 +101,12 @@ def chat_with_supervisor(
 
     db.add(Message(conversation_id=convo.id, role="user", content=req.message))
     db.commit()
+
+    # If this message is a plain "yes / confirm / approve" and a fresh proposal
+    # (transfer draft, command awaiting approval) is waiting in this conversation,
+    # mark it approved. This runs in code, on the user's raw message, before the
+    # agent starts. Nothing the model reads can reach this step.
+    approve_latest_pending_if_confirmed(user.id, convo.id, req.message)
 
     supervisor = OgunAIAgent(
         role_config=SUPERVISOR_CONFIG,

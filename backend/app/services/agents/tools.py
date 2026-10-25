@@ -17,6 +17,11 @@ from sentence_transformers import SentenceTransformer
 
 from ...config import settings
 from ...database import SessionLocal
+from .events import emit_event
+from .guards import (
+    get_turn_context, create_pending_action,
+    is_sensitive_path, command_touches_secrets,
+)
 from ...models import (
     UserLike, DailyNutrition, WorkoutLog, PhysicalStatus,
     Document, DocumentChunk, LearningProgress, ConversationMemory
@@ -321,7 +326,11 @@ def read_file(file_path: str) -> Dict[str, Any]:
         if not os.path.isabs(file_path):
             workspace_path = os.path.join(settings.WORKSPACE_DIR, file_path)
             if os.path.exists(workspace_path):
-                file_path = workspace_path
+                    file_path = workspace_path
+        # Agents must never read credentials: an injected instruction could
+        # otherwise read .env and smuggle the keys out inside a search query.
+        if is_sensitive_path(file_path):
+            return {"error": "Access denied: that file may contain credentials or private data and cannot be read by agents."}
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
         return {"content": content[:8000], "truncated": len(content) > 8000, "path": file_path}
@@ -582,6 +591,12 @@ def run_terminal(command: str) -> Dict[str, Any]:
     for blocked in _BLOCKED_SUBSTRINGS:
         if blocked in command:
             return {"error": f"Blocked for safety — command contains '{blocked}'."}
+    # Safety: keep the shell away from credentials (.env, databases, SSH keys,
+    # saved browser sessions). A speed bump against the lazy injection payload
+    # ("type ..\\.env"), not a sandbox; the approval gate in guards.py is the
+    # real protection once a request has touched external content.
+    if command_touches_secrets(command):
+        return {"error": "Blocked for safety — the command references a credentials or secrets file."}
 
     # Safety: block dangerous root commands
     try:
@@ -1000,16 +1015,33 @@ def fetch_transactions(
 @register_tool("draft_transfer")
 def draft_transfer(amount: float, recipient: str, description: str) -> Dict[str, Any]:
     """Prepares a transfer for user review. Does NOT move money. Always call before execute_transfer."""
+    if amount <= 0:
+        return {"error": "amount must be greater than 0."}
+
+    # Save the draft in the approval ledger. execute_transfer is blocked in
+    # code (guards.py) until the USER replies with a confirmation to this
+    # exact draft, so the model cannot skip this step or invent a confirmation.
+    draft_id = create_pending_action(
+        tool_name="execute_transfer",
+        args={"amount": amount, "recipient": recipient, "description": description},
+        summary=f"Transfer {amount:,.2f} NGN to {recipient} ({description})",
+    )
+    if draft_id is None:
+        return {"error": "Could not save the draft: transfers can only be drafted inside a chat conversation."}
+
     return {
         "status": "pending_approval",
+        "draft_id": draft_id,
         "amount_ngn": amount,
         "amount_kobo": int(amount * 100),
         "recipient": recipient,
         "description": description,
         "currency": "NGN",
-        "message": "Draft ready. Awaiting user confirmation before execution."
+        "message": (
+            "Draft saved. Show this draft to the user and STOP. Do not call execute_transfer in this turn: "
+            "it only works after the user replies with an explicit confirmation such as 'yes, confirm'."
+        ),
     }
-
 
 @register_tool("execute_transfer")
 def execute_transfer(amount: float, recipient: str, description: str) -> Dict[str, Any]:
@@ -1741,13 +1773,12 @@ def predict_injury_risk(user_id: int) -> Dict[str, Any]:
 
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
-
 @register_tool("delegate_to")
 def delegate_to(specialist_name: str, instruction: str, user_id: int) -> Dict[str, Any]:
     """
     Delegates a sub-task to a specialist agent.
-    Available: 'DeveloperAgent', 'LifestyleAgent', 'CyberSecurityAgent',
-    'ResearchAgent', 'FinanceAgent', 'FitnessAgent'.
+    Available: 'DeveloperAgent', 'ResearchAgent', 'FinanceAgent', 'FitnessAgent',
+    'LifestyleAgent', 'CyberSecurityAgent', 'TutorAgent'.
     """
     from .base import OgunAIAgent
     from .configs import SPECIALIST_CONFIGS
@@ -1761,6 +1792,25 @@ def delegate_to(specialist_name: str, instruction: str, user_id: int) -> Dict[st
         }
 
     config = SPECIALIST_CONFIGS[specialist_name]
-    specialist = OgunAIAgent(role_config=config, user_id=user_id)
+
+    # Powers the 'Supervisor -> Specialist' cards in the activity panel.
+    emit_event("specialist_start", {
+        "specialist": specialist_name,
+        "instruction_preview": instruction[:120],
+    })
+
+    # Pass the conversation id down so the specialist's tool calls are logged
+    # to the episodes table too (before, only the Supervisor's were).
+    ctx = get_turn_context()
+    specialist = OgunAIAgent(
+        role_config=config,
+        user_id=user_id,
+        conversation_id=ctx.conversation_id if ctx else None,
+    )
     result = specialist.run(instruction)
+
+    emit_event("specialist_done", {"specialist": specialist_name})
     return {"specialist_result": result}
+
+
+
