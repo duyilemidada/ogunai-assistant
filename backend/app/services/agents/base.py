@@ -55,6 +55,19 @@ class OgunAIAgent:
             tail = tail[1:]
         self.history = [system] + tail
 
+    def _recent_context_for_handoff(self, max_messages: int = 4, max_chars_each: int = 1200) -> str:
+        """
+        The last few user/assistant messages flattened to plain text, so a
+        specialist can follow up on what was just discussed (a transfer draft
+        the user is now confirming, code pasted a message ago).
+        """
+        lines = []
+        for m in self.history[1:][-max_messages:]:
+            if m.get("role") in ("user", "assistant") and m.get("content"):
+                who = "User" if m["role"] == "user" else "Ogun"
+                lines.append(f"{who}: {m['content'][:max_chars_each]}")
+        return "\n".join(lines)
+
     def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name not in self.role_config["tools"]:
             return {
@@ -102,7 +115,11 @@ class OgunAIAgent:
             if event_callback is not None:
                 set_callback(event_callback)
             if self.user_id is not None and get_turn_context() is None:
-                set_turn_context(self.user_id, self.conversation_id)
+                set_turn_context(
+                    self.user_id, self.conversation_id,
+                    user_message=user_input,
+                    recent_context=self._recent_context_for_handoff(),
+                )
                 owns_turn_context = True
 
             self.history.append({"role": "user", "content": user_input})

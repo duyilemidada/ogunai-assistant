@@ -20,7 +20,7 @@ from ...database import SessionLocal
 from .events import emit_event
 from .guards import (
     get_turn_context, create_pending_action,
-    is_sensitive_path, command_touches_secrets,
+    is_sensitive_path, command_touches_secrets, build_specialist_task
 )
 from ...models import (
     UserLike, DailyNutrition, WorkoutLog, PhysicalStatus,
@@ -1807,7 +1807,9 @@ def delegate_to(specialist_name: str, instruction: str, user_id: int) -> Dict[st
         user_id=user_id,
         conversation_id=ctx.conversation_id if ctx else None,
     )
-    result = specialist.run(instruction)
+    # build_specialist_task attaches the user's original message (and recent
+    # context) so the specialist sees what the user actually pasted.
+    result = specialist.run(build_specialist_task(instruction))
 
     emit_event("specialist_done", {"specialist": specialist_name})
     return {"specialist_result": result}
