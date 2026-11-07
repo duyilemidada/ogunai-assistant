@@ -7,6 +7,7 @@ from ..database import get_db
 from ..models import User, Conversation, Message
 from ..schemas import ConversationSummaryResponse, MessageResponse
 from .chat import get_current_user   # reuses the same auth dependency as chat.py
+from ..services.agents.formatting import normalize_code_fences
 
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
 
@@ -45,9 +46,16 @@ def get_conversation_messages(
     if not convo:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    return db.query(Message).filter(
+    rows = db.query(Message).filter(
         Message.conversation_id == conversation_id
     ).order_by(Message.created_at.asc()).all()
+
+    # Messages saved before formatting.py existed can still have untagged code
+    # blocks. Fix them on the way out (nothing is written back to the database).
+    return [
+        MessageResponse.model_validate(r).model_copy(update={"content": normalize_code_fences(r.content)})
+        for r in rows
+    ]
 
 
 @router.delete("/{conversation_id}", status_code=204)

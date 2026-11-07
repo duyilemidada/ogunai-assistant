@@ -3,11 +3,13 @@ import os
 import json
 import shutil
 import asyncio
-from typing import List, Dict
+import threading
+from typing import List, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from jose import jwt, JWTError
 
@@ -17,12 +19,53 @@ from ..schemas import ChatRequest, MessageResponse
 from ..config import settings
 from ..services.agents.base import OgunAIAgent
 from ..services.agents.configs import SUPERVISOR_CONFIG
-from ..services.agents.guards import approve_latest_pending_if_confirmed
+from ..services.agents.formatting import normalize_code_fences
+from ..services.agents.guards import approve_latest_pending_if_confirmed, pending_notice, utcnow
 from ..services.agents.tools import _process_pdf, store_conversation_memory, generate_conversation_title
 
 router  = APIRouter(prefix="/chat", tags=["Chat"])
 _bearer = HTTPBearer()
 
+# The stream sends nothing while a slow tool runs; if nothing at all arrives
+# for this long, give up on the turn (and stop the agent, see event_generator).
+AGENT_EVENT_TIMEOUT = 120
+
+_SSE_HEADERS = {
+    "Cache-Control":     "no-cache",
+    "Connection":        "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+STOPPED_REPLY = "Stopped before I finished. Steps that had already completed were not undone."
+
+
+# ─── Running turns (so the Stop button can find them) ────────────────────────
+# One entry per in-flight streamed turn, keyed by (user, conversation). The
+# value is the threading.Event the agent loop checks (see guards.is_cancelled).
+# The user id is part of the key, so nobody can stop someone else's turn.
+
+_active_runs: Dict[Tuple[int, int], threading.Event] = {}
+_active_lock = threading.Lock()
+
+
+def _register_run(user_id: int, conversation_id: int, event: threading.Event) -> None:
+    with _active_lock:
+        _active_runs[(user_id, conversation_id)] = event
+
+
+def _unregister_run(user_id: int, conversation_id: int, event: threading.Event) -> None:
+    with _active_lock:
+        # Only remove our own entry: a newer turn may have replaced it.
+        if _active_runs.get((user_id, conversation_id)) is event:
+            del _active_runs[(user_id, conversation_id)]
+
+
+def _get_run(user_id: int, conversation_id: int) -> Optional[threading.Event]:
+    with _active_lock:
+        return _active_runs.get((user_id, conversation_id))
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
@@ -40,6 +83,8 @@ def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
+# ─── Helpers shared by both chat endpoints ───────────────────────────────────
 
 def _load_recent_history(db: Session, conversation_id: int, limit: int = 10) -> List[Dict[str, str]]:
     """
@@ -74,12 +119,10 @@ def _load_recent_history(db: Session, conversation_id: int, limit: int = 10) -> 
     return history
 
 
-@router.post("/", response_model=MessageResponse)
-def chat_with_supervisor(
-    req: ChatRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
+def _open_conversation(
+    req: ChatRequest, user: User, db: Session
+) -> Tuple[Conversation, List[Dict[str, str]], bool]:
+    """Find the requested conversation (or start one) and save the user's message in it."""
     if req.conversation_id:
         convo = db.query(Conversation).filter(
             Conversation.id == req.conversation_id,
@@ -101,13 +144,54 @@ def chat_with_supervisor(
 
     db.add(Message(conversation_id=convo.id, role="user", content=req.message))
     db.commit()
+    return convo, prior_history, is_new_conversation
 
-    # If this message is a plain "yes / confirm / approve" and a fresh proposal
-    # (transfer draft, command awaiting approval) is waiting in this conversation,
-    # mark it approved. This runs in code, on the user's raw message, before the
-    # agent starts. Nothing the model reads can reach this step.
-    approve_latest_pending_if_confirmed(user.id, convo.id, req.message)
 
+def _save_supervisor_message(db: Session, conversation_id: int, content: str) -> Message:
+    msg = Message(conversation_id=conversation_id, role="supervisor", content=content)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+
+def _finalize_reply(
+    agent_text: str, user_id: int, conversation_id: int, turn_started, cancelled: bool = False
+) -> str:
+    """
+    The text that is saved and shown. Two things happen in code, after the
+    model has finished and out of its reach:
+      1. untagged / ```text code blocks get their real language tag;
+      2. any action that was queued for approval this turn is listed, so the
+         user always sees exactly what they would be approving.
+    """
+    body = STOPPED_REPLY if cancelled else normalize_code_fences(agent_text or "")
+    return body + pending_notice(user_id, conversation_id, turn_started)
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@router.post("/", response_model=MessageResponse)
+def chat_with_supervisor(
+    req: ChatRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    convo, prior_history, is_new_conversation = _open_conversation(req, user, db)
+
+    # A plain "yes / approve" is matched in code, on the user's raw message,
+    # before the agent starts. Nothing the model reads can reach this step.
+    # If it is ambiguous (several actions waiting) or names something that is
+    # not waiting, answer right here with code-written text: no agent run.
+    approval = approve_latest_pending_if_confirmed(user.id, convo.id, req.message)
+    if approval and approval.get("reply"):
+        return _save_supervisor_message(db, convo.id, approval["reply"])
+
+    turn_started = utcnow()
     supervisor = OgunAIAgent(
         role_config=SUPERVISOR_CONFIG,
         user_id=user.id,
@@ -120,10 +204,9 @@ def chat_with_supervisor(
         convo.title = generate_conversation_title(req.message, final_text)
         db.commit()
 
-    agent_msg = Message(conversation_id=convo.id, role="supervisor", content=final_text)
-    db.add(agent_msg)
-    db.commit()
-    db.refresh(agent_msg)
+    agent_msg = _save_supervisor_message(
+        db, convo.id, _finalize_reply(final_text, user.id, convo.id, turn_started)
+    )
 
     # Fire-and-forget-style: stores an embedding of this exchange for future
     # cross-conversation recall. Failure here is logged, never raised —
@@ -139,107 +222,133 @@ async def stream_chat(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if req.conversation_id:
-        convo = db.query(Conversation).filter(
-            Conversation.id == req.conversation_id,
-            Conversation.user_id == user.id
-        ).first()
-        if not convo:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        prior_history = _load_recent_history(db, convo.id)
-        is_new_conversation = False          # ← was missing
-    else:
-        convo = Conversation(user_id=user.id, title=req.message[:50])
-        db.add(convo)
-        db.commit()
-        db.refresh(convo)
-        prior_history = []
-        is_new_conversation = True           # ← was missing
-
-    db.add(Message(conversation_id=convo.id, role="user", content=req.message))
-    db.commit()
+    convo, prior_history, is_new_conversation = _open_conversation(req, user, db)
 
     user_id  = user.id
     convo_id = convo.id
     msg_text = req.message
-    loop     = asyncio.get_event_loop()
 
+    # Same approval step as the non-streaming endpoint (this one used to skip
+    # it, so "yes" could never approve anything from the streaming UI).
+    approval = approve_latest_pending_if_confirmed(user_id, convo_id, msg_text)
+    if approval and approval.get("reply"):
+        saved = _save_supervisor_message(db, convo_id, approval["reply"])
+        saved_id, saved_content = saved.id, saved.content
+
+        async def instant_reply():
+            yield _sse({"type": "started", "conversation_id": convo_id})
+            yield _sse({"type": "saved", "message_id": saved_id,
+                        "conversation_id": convo_id, "content": saved_content})
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(instant_reply(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    loop         = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
-    final_response        = [None]
+    cancel_event = threading.Event()
+    turn_started = utcnow()
+    _register_run(user_id, convo_id, cancel_event)
 
     def on_event(event_type: str, data: dict):
         payload = json.dumps({"type": event_type, **data})
         loop.call_soon_threadsafe(queue.put_nowait, payload)
 
     def run_agent_sync():
+        """
+        Runs the whole turn on a worker thread AND saves its result. Saving
+        happens here (not in the SSE generator below) so that a turn the user
+        stopped, or whose browser tab closed, still ends with a saved message.
+        """
+        agent_text = ""
         try:
-            supervisor = OgunAIAgent(
-                role_config=SUPERVISOR_CONFIG,
-                user_id=user_id,
-                conversation_id=convo_id,
-                history_messages=prior_history,
-            )
-            final_response[0] = supervisor.run(msg_text, event_callback=on_event)
+            try:
+                supervisor = OgunAIAgent(
+                    role_config=SUPERVISOR_CONFIG,
+                    user_id=user_id,
+                    conversation_id=convo_id,
+                    history_messages=prior_history,
+                )
+                agent_text = supervisor.run(msg_text, event_callback=on_event, cancel_event=cancel_event)
+            except Exception as e:
+                agent_text = f"Error: {e}"
 
-            if is_new_conversation:
-                title_db = SessionLocal()
-                try:
-                    c = title_db.query(Conversation).filter(Conversation.id == convo_id).first()
+            cancelled = cancel_event.is_set()
+            failed    = agent_text.startswith("Error: ")
+
+            save_db = SessionLocal()
+            try:
+                if is_new_conversation and not cancelled and not failed:
+                    c = save_db.query(Conversation).filter(Conversation.id == convo_id).first()
                     if c:
-                        c.title = generate_conversation_title(msg_text, final_response[0])
-                        title_db.commit()
-                finally:
-                    title_db.close()
+                        c.title = generate_conversation_title(msg_text, agent_text)
+                        save_db.commit()
+
+                msg = _save_supervisor_message(
+                    save_db, convo_id,
+                    _finalize_reply(agent_text, user_id, convo_id, turn_started, cancelled=cancelled),
+                )
+                saved_id, saved_content = msg.id, msg.content
+            finally:
+                save_db.close()
+
+            if not cancelled and not failed:
+                store_conversation_memory(user_id, convo_id, msg_text, agent_text)
+
+            on_event("saved", {
+                "message_id": saved_id, "conversation_id": convo_id, "content": saved_content,
+            })
         except Exception as e:
-            final_response[0] = f"Error: {e}"
+            on_event("error", {"message": f"Save failed: {e}"})
         finally:
+            _unregister_run(user_id, convo_id, cancel_event)
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     loop.run_in_executor(None, run_agent_sync)
 
     async def event_generator():
         try:
+            # Tells the frontend the conversation id straight away, so its Stop
+            # button can call POST /chat/cancel even for a brand-new chat.
+            yield _sse({"type": "started", "conversation_id": convo_id})
             while True:
-                item = await asyncio.wait_for(queue.get(), timeout=120)
+                item = await asyncio.wait_for(queue.get(), timeout=AGENT_EVENT_TIMEOUT)
                 if item is None:
                     break
                 yield f"data: {item}\n\n"
-
-            save_db = SessionLocal()
-            try:
-                msg = Message(
-                    conversation_id=convo_id,
-                    role="supervisor",
-                    content=final_response[0] or ""
-                )
-                save_db.add(msg)
-                save_db.commit()
-                save_db.refresh(msg)
-
-                store_conversation_memory(user_id, convo_id, msg_text, final_response[0] or "")
-
-                yield f"data: {json.dumps({'type': 'saved', 'message_id': msg.id, 'conversation_id': convo_id, 'content': msg.content})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'message': f'Save failed: {e}'})}\n\n"
-            finally:
-                save_db.close()
-
+        except (asyncio.CancelledError, GeneratorExit):
+            # The browser disconnected (tab closed, fetch aborted by Stop).
+            # Without this the agent would keep running with nobody listening:
+            # still calling the LLM, still able to run tools.
+            cancel_event.set()
+            raise
         except asyncio.TimeoutError:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Agent timed out after 120s'})}\n\n"
+            cancel_event.set()
+            yield _sse({"type": "error", "message": f"Agent timed out after {AGENT_EVENT_TIMEOUT}s"})
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-        finally:
-            yield "data: [DONE]\n\n"
+            cancel_event.set()
+            yield _sse({"type": "error", "message": str(e)})
+        yield "data: [DONE]\n\n"
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":     "no-cache",
-            "Connection":        "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+class CancelRequest(BaseModel):
+    conversation_id: int
+
+
+@router.post("/cancel")
+def cancel_run(req: CancelRequest, user: User = Depends(get_current_user)):
+    """
+    The Stop button. Tells the running agent for this conversation to stop at
+    its next step: no further LLM calls, no further tools, and a shell command
+    already running is killed. Steps that already finished are not undone.
+    """
+    event = _get_run(user.id, req.conversation_id)
+    if event is None:
+        return {"cancelled": False, "detail": "Nothing is running for that conversation."}
+    event.set()
+    return {"cancelled": True}
+
 
 @router.post("/upload")
 async def upload_document(

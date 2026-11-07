@@ -23,6 +23,8 @@ What's in here
 4. Result rendering  - tool output is delimited as untrusted data, and
                        suspicious phrases are flagged (not deleted).
 5. Secret-path checks - keep agents away from .env, databases, SSH keys.
+6. Cancel signal     - lets the user's Stop button reach a running agent
+                       (see is_cancelled and chat.py).
 """
 import json
 import os
@@ -30,7 +32,7 @@ import re
 import threading
 import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ...database import SessionLocal
 from ...models import PendingAction
@@ -65,6 +67,7 @@ class TurnContext:
     tainted: bool = False
     user_message: str = ""      # the user's own words for this turn (trusted)
     recent_context: str = ""    # last few messages of the conversation, for hand-offs
+    cancel_event: Optional[threading.Event] = None   # set by chat.py when the user hits Stop
 
 
 _turn = threading.local()
@@ -75,10 +78,12 @@ def set_turn_context(
     conversation_id: Optional[int],
     user_message: str = "",
     recent_context: str = "",
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
     _turn.ctx = TurnContext(
         user_id=user_id, conversation_id=conversation_id,
         user_message=user_message, recent_context=recent_context,
+        cancel_event=cancel_event,
     )
 
 
@@ -88,6 +93,17 @@ def get_turn_context() -> Optional[TurnContext]:
 
 def clear_turn_context() -> None:
     _turn.ctx = None
+
+
+def is_cancelled() -> bool:
+    """
+    True once the user has pressed Stop (or the browser went away) for this turn.
+    The agent loop checks this before every LLM call and before every tool
+    runs, so a stopped turn cannot start anything new. Specialists share the
+    Supervisor's turn context, so one signal stops the whole delegation chain.
+    """
+    ctx = get_turn_context()
+    return bool(ctx is not None and ctx.cancel_event is not None and ctx.cancel_event.is_set())
 
 
 # A pasted file or long message is cut here when handed to a specialist, so a
@@ -139,6 +155,9 @@ def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
 
+utcnow = _utcnow   # public alias: chat.py stamps the start of each turn with it
+
+
 # ─── 2. Approval ledger ───────────────────────────────────────────────────────
 
 def _norm_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -164,15 +183,15 @@ def _norm_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     return {"args": json.dumps(args, sort_keys=True, default=str)}
 
 
-def _describe(tool_name: str, args: Dict[str, Any]) -> str:
+def _describe(tool_name: str, args: Dict[str, Any], limit: int = 300) -> str:
     """Human-readable one-liner the agent can show the user for approval."""
     if tool_name == "run_terminal":
-        return f"Run shell command: {args.get('command', '')}"[:300]
+        return f"Run shell command: {args.get('command', '')}"[:limit]
     if tool_name == "github_api":
-        return f"GitHub {str(args.get('method', 'GET')).upper()} {args.get('endpoint', '')}"[:300]
+        return f"GitHub {str(args.get('method', 'GET')).upper()} {args.get('endpoint', '')}"[:limit]
     if tool_name == "execute_transfer":
-        return f"Transfer {args.get('amount')} to {args.get('recipient')} ({args.get('description', '')})"[:300]
-    return f"{tool_name} {json.dumps(args, default=str)}"[:300]
+        return f"Transfer {args.get('amount')} to {args.get('recipient')} ({args.get('description', '')})"[:limit]
+    return f"{tool_name} {json.dumps(args, default=str)}"[:limit]
 
 
 def create_pending_action(
@@ -235,19 +254,79 @@ _CONFIRM_STRONG = frozenset({
 _CONFIRM_FILLER = frozenset({
     "it", "that", "this", "please", "ahead", "now", "i", "the", "transfer",
     "command", "draft", "and", "then",
+    # Naming words: "approve transfer" / "approve command" pick WHICH pending
+    # action is meant when several are waiting (see _HINT_WORDS).
+    "payment", "shell", "terminal", "github",
 })
+
+# Words in a confirmation that say which kind of action the user means.
+_HINT_WORDS = {
+    "transfer": "execute_transfer", "payment": "execute_transfer",
+    "command": "run_terminal", "shell": "run_terminal", "terminal": "run_terminal",
+    "github": "github_api",
+}
+# Short name shown to the user, and the word they reply with.
+_TOOL_LABELS = {"execute_transfer": "transfer", "run_terminal": "command", "github_api": "github"}
+
+
+def _label(tool_name: str) -> str:
+    return _TOOL_LABELS.get(tool_name, tool_name)
+
+
+def _confirmation_words(message: str) -> Optional[List[str]]:
+    """The words of the message if it is a plain confirmation, else None."""
+    cleaned = re.sub(r"[.,!\s]+", " ", (message or "").lower()).strip()
+    if not cleaned or re.search(r"[^a-z' ]", cleaned):   # digits, '?', emoji, symbols -> no
+        return None
+    words = cleaned.split()
+    if len(words) > 10:
+        return None
+    if not all(w in _CONFIRM_STRONG or w in _CONFIRM_FILLER for w in words):
+        return None
+    if not any(w in _CONFIRM_STRONG for w in words):
+        return None
+    return words
 
 
 def is_confirmation(message: str) -> bool:
-    cleaned = re.sub(r"[.,!\s]+", " ", (message or "").lower()).strip()
-    if not cleaned or re.search(r"[^a-z' ]", cleaned):   # digits, '?', emoji, symbols -> no
-        return False
-    words = cleaned.split()
-    if len(words) > 10:
-        return False
-    if not all(w in _CONFIRM_STRONG or w in _CONFIRM_FILLER for w in words):
-        return False
-    return any(w in _CONFIRM_STRONG for w in words)
+    return _confirmation_words(message) is not None
+
+
+def _fresh_pending(db, user_id: int, conversation_id: int):
+    return db.query(PendingAction).filter(
+        PendingAction.user_id == user_id,
+        PendingAction.conversation_id == conversation_id,
+        PendingAction.status == "pending",
+        PendingAction.created_at >= _utcnow() - PENDING_TTL,
+    ).order_by(PendingAction.created_at.desc(), PendingAction.id.desc()).all()
+
+
+# What the user is shown must be what will actually run. The stored summary is
+# cut at 300 characters, which would let a long command hide its tail, so for
+# commands and GitHub calls the notice is rebuilt from the full stored args.
+_FULL_DISPLAY_LIMIT = 1500
+
+
+def _shown_summary(row) -> str:
+    if row.tool_name in ("run_terminal", "github_api") and isinstance(row.args, dict):
+        text = _describe(row.tool_name, row.args, limit=_FULL_DISPLAY_LIMIT)
+        if len(json.dumps(row.args, default=str)) > _FULL_DISPLAY_LIMIT:
+            text += "  [... longer than shown: do NOT approve a command you cannot read in full]"
+        return text
+    return row.summary
+
+
+def _options(rows) -> List[Dict[str, Any]]:
+    return [{"id": r.id, "tool_name": r.tool_name, "label": _label(r.tool_name), "summary": _shown_summary(r)} for r in rows]
+
+
+def _listing(options: List[Dict[str, Any]]) -> str:
+    return "\n".join(f"- {o['label']}: {o['summary']}" for o in options)
+
+
+def _choose_phrase(options: List[Dict[str, Any]]) -> str:
+    labels = list(dict.fromkeys(o["label"] for o in options))
+    return " or ".join(f"'approve {l}'" for l in labels)
 
 
 def approve_latest_pending_if_confirmed(
@@ -255,26 +334,67 @@ def approve_latest_pending_if_confirmed(
 ) -> Optional[Dict[str, Any]]:
     """
     Called by chat.py BEFORE the agent runs, with the user's raw message.
-    If it is a plain confirmation and a fresh proposal is waiting in this
-    conversation, mark that proposal approved. The model never sees or
-    controls this step, and text from web pages or documents cannot reach it.
+    The model never sees or controls this step, and text from web pages or
+    documents cannot reach it.
+
+    A bare "yes" can only mean ONE thing. Different tools can each have a
+    proposal waiting (a transfer draft AND a shell command), and the old
+    version approved whichever was newest, so "yes" to the transfer you were
+    looking at could silently approve a command you had never seen. Now:
+
+      - exactly one proposal waiting          -> approve it
+      - several waiting, bare "yes"           -> approve NOTHING, ask which
+      - "approve transfer" / "approve command"-> approve only that kind
+      - names a kind that isn't waiting       -> approve nothing, say what is
+
+    Returns None (not a confirmation, or nothing waiting) or a dict with a
+    "status" of "approved", "ambiguous" or "no_match". The last two carry a
+    ready-made "reply" for chat.py to send WITHOUT running the agent.
     """
-    if conversation_id is None or not is_confirmation(message):
+    if conversation_id is None:
         return None
+    words = _confirmation_words(message)
+    if words is None:
+        return None
+    hinted = {_HINT_WORDS[w] for w in words if w in _HINT_WORDS}
+
     db = SessionLocal()
     try:
-        row = db.query(PendingAction).filter(
-            PendingAction.user_id == user_id,
-            PendingAction.conversation_id == conversation_id,
-            PendingAction.status == "pending",
-            PendingAction.created_at >= _utcnow() - PENDING_TTL,
-        ).order_by(PendingAction.created_at.desc(), PendingAction.id.desc()).first()
-        if row is None:
+        rows = _fresh_pending(db, user_id, conversation_id)
+        if not rows:
             return None
-        row.status = "approved"
-        row.approved_at = _utcnow()
-        info = {"id": row.id, "tool_name": row.tool_name, "summary": row.summary}
+        options = _options(rows)
+
+        if len(hinted) > 1:
+            return {
+                "status": "ambiguous", "options": options,
+                "reply": ("You named more than one action. I approve one at a time so you see exactly what you are "
+                          f"allowing. Waiting for approval:\n{_listing(options)}\n\nReply with just one of: {_choose_phrase(options)}."),
+            }
+        if hinted:
+            rows = [r for r in rows if r.tool_name in hinted]
+            if not rows:
+                return {
+                    "status": "no_match", "options": options,
+                    "reply": (f"Nothing of that kind is waiting for approval, so I approved nothing. "
+                              f"Waiting for approval:\n{_listing(options)}\n\nReply {_choose_phrase(options)} for the one you mean."),
+                }
+        if len(rows) > 1:
+            return {
+                "status": "ambiguous", "options": options,
+                "reply": ("More than one action is waiting for your approval, so I approved none of them. "
+                          f"Waiting for approval:\n{_listing(options)}\n\nReply with just one of: {_choose_phrase(options)}."),
+            }
+
+        row = rows[0]
+        info = {"status": "approved", "id": row.id, "tool_name": row.tool_name, "summary": row.summary}
+        # Compare-and-swap, same trick as _consume_approved: only flips if still pending.
+        changed = db.query(PendingAction).filter(
+            PendingAction.id == row.id, PendingAction.status == "pending"
+        ).update({"status": "approved", "approved_at": _utcnow()}, synchronize_session=False)
         db.commit()
+        if changed != 1:
+            return None
         print(f"  [GATE] user approved pending action #{info['id']}: {info['summary']}")
         return info
     except Exception as e:
@@ -283,6 +403,37 @@ def approve_latest_pending_if_confirmed(
         return None
     finally:
         db.close()
+
+
+def pending_notice(user_id: int, conversation_id: Optional[int], since: dt.datetime) -> str:
+    """
+    A code-written footer listing every action waiting for approval, added to
+    the reply by chat.py whenever one was created during this turn.
+
+    Why code and not the model: approval is only meaningful if the user SAW
+    what they are approving. A model that was fed a poisoned page can fail to
+    mention a command it queued; this footer cannot be skipped by the model.
+    """
+    if conversation_id is None:
+        return ""
+    db = SessionLocal()
+    try:
+        rows = _fresh_pending(db, user_id, conversation_id)
+        if not any(r.created_at >= since for r in rows):
+            return ""
+        options = _options(rows)
+    except Exception as e:
+        print(f"  [GATE] pending notice failed: {e}")
+        return ""
+    finally:
+        db.close()
+
+    if len(options) == 1:
+        tail = "Reply 'approve' to allow it. If you ignore it, it expires in 10 minutes."
+    else:
+        tail = (f"More than one action is waiting, so a bare 'yes' approves none of them. "
+                f"Reply {_choose_phrase(options)} to pick one.")
+    return f"\n\nWaiting for your approval (nothing has run yet):\n{_listing(options)}\n{tail}"
 
 
 def _consume_approved(ctx: TurnContext, tool_name: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:

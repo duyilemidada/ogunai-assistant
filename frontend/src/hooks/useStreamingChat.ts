@@ -23,6 +23,9 @@ export function useStreamingChat() {
   const queryClient = useQueryClient()
 
   const controllerRef = useRef<AbortController | null>(null)
+  // The backend now sends {type:'started', conversation_id} as the first event,
+  // so Stop works even in a brand-new chat that has no id yet on the frontend.
+  const conversationIdRef = useRef<number | null>(null)
 
   const send = async (text: string) => {
     const wasNewConversation = activeConversationId === null
@@ -35,6 +38,7 @@ export function useStreamingChat() {
 
     const controller = new AbortController()
     controllerRef.current = controller
+    conversationIdRef.current = conversationIdAtSendTime
 
     try {
       await fetchEventSource(`${API_BASE_URL}/api/v1/chat/stream`, {
@@ -60,6 +64,11 @@ export function useStreamingChat() {
           }
 
           switch (event.type) {
+            case 'started': {
+              conversationIdRef.current = event.conversation_id
+              break
+            }
+
             case 'thinking':
             case 'tool_call':
             case 'tool_result':
@@ -119,11 +128,42 @@ export function useStreamingChat() {
     } finally {
       setStreaming(false)
       setTimeout(() => closeActivity(), 900)
-      controllerRef.current = null
+      if (controllerRef.current === controller) controllerRef.current = null
     }
   }
 
-  const cancel = () => controllerRef.current?.abort()
+  const cancel = async () => {
+    const controller = controllerRef.current
+    if (!controller) return
+
+    const conversationId = conversationIdRef.current
+    if (conversationId === null) {
+      controller.abort() // id not known yet: closing the stream still stops the agent
+      return
+    }
+
+    // Ask the server to stop. The stream then ends by itself and delivers the
+    // "Stopped" message, so the chat shows what happened.
+    try {
+      await fetch(`${API_BASE_URL}/api/v1/chat/cancel`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ conversation_id: conversationId }),
+      })
+    } catch {
+      controller.abort()
+      return
+    }
+
+    // Safety net: if the stream is still open after 8s, close it. The server
+    // also stops the agent when the connection closes.
+    setTimeout(() => {
+      if (controllerRef.current === controller) controller.abort()
+    }, 8000)
+  }
 
   return { send, cancel, messages: currentMessages() }
 }

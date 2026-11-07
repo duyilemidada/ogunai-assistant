@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -19,9 +20,10 @@ from ...config import settings
 from ...database import SessionLocal
 from .events import emit_event
 from .guards import (
-    get_turn_context, create_pending_action,
+    get_turn_context, create_pending_action, is_cancelled,
     is_sensitive_path, command_touches_secrets, build_specialist_task
 )
+from .search_providers import search as _search_web
 from ...models import (
     UserLike, DailyNutrition, WorkoutLog, PhysicalStatus,
     Document, DocumentChunk, LearningProgress, ConversationMemory
@@ -290,33 +292,9 @@ _BLOCKED_COMMANDS = {
 @register_tool("web_search")
 def web_search(query: str) -> Dict[str, Any]:
     """Searches the web for information. Use for facts, current events, and documentation."""
-    if not settings.TAVILY_API_KEY:
-        return {"error": "TAVILY_API_KEY is missing in settings/.env"}
-
-    try:
-        resp = httpx.post(
-            "https://api.tavily.com/search",
-            headers={
-                "Authorization": f"Bearer {settings.TAVILY_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "query": query,
-                "include_answer": True,
-                "max_results": 5
-            },
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return {
-            "results": [
-                {"title": r["title"], "url": r["url"], "snippet": r.get("content", "")}
-                for r in data.get("results", [])
-            ]
-        }
-    except Exception as e:
-        return {"error": f"Tavily API Error: {str(e)}"}
+    # Tries SearXNG, Tavily and DuckDuckGo in turn (see search_providers.py),
+    # so one blocked or exhausted back-end no longer means "no search".
+    return _search_web(query, max_results=5)
 
 @register_tool("read_file")
 def read_file(file_path: str) -> Dict[str, Any]:
@@ -338,8 +316,8 @@ def read_file(file_path: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 # ─── Tutor Tools ──────────────────────────────────────────────────────────────
-# All four call the existing web_search() function above — same Tavily backend,
-# no duplicate search logic, no second provider to configure.
+# All four call the existing web_search() function above — same search chain
+# (search_providers.py), no duplicate search logic, no second provider to configure.
 
 @register_tool("assess_prerequisite")
 def assess_prerequisite(topic: str) -> Dict[str, Any]:
@@ -577,6 +555,51 @@ def daily_deep_read(topic_area: str = "auto") -> Dict[str, Any]:
 
 # ─── Developer Tools ──────────────────────────────────────────────────────────
 
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Kill the shell AND anything it started (a plain proc.kill() leaves children running)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=5)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_shell_cancellable(command: str, cwd: str, timeout: float):
+    """
+    Like subprocess.run(..., shell=True, capture_output=True, timeout=...), but
+    it wakes every 0.25s to check whether the user pressed Stop.
+    Returns (returncode, stdout, stderr, aborted) where aborted is None,
+    "timeout" or "cancelled".
+    """
+    kwargs: Dict[str, Any] = {}
+    if os.name != "nt":
+        kwargs["start_new_session"] = True      # own process group, so the whole tree can be killed
+    proc = subprocess.Popen(
+        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd=cwd, **kwargs,
+    )
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=0.25)
+            return proc.returncode, stdout, stderr, None
+        except subprocess.TimeoutExpired:
+            reason = "cancelled" if is_cancelled() else ("timeout" if time.monotonic() >= deadline else None)
+            if reason is None:
+                continue
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=2)
+            except Exception:
+                pass
+            return None, "", "", reason
+
+
 @register_tool("run_terminal")
 def run_terminal(command: str) -> Dict[str, Any]:
     """
@@ -608,23 +631,20 @@ def run_terminal(command: str) -> Dict[str, Any]:
         pass  # shlex can't parse it — let subprocess handle the error
 
     try:
-        proc = subprocess.run(
-            command,
-            shell=True,          # Shell needed for pipes, &&, redirects
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=workspace        # Always starts in workspace — relative paths stay sandboxed
-        )
+        # shell=True is needed for pipes, && and redirects. cwd is always the
+        # workspace, so relative paths stay sandboxed. Polls for the Stop button.
+        returncode, stdout, stderr, aborted = _run_shell_cancellable(command, workspace, timeout=30)
+        if aborted == "timeout":
+            return {"error": "Command timed out (30s limit). Use background processes for long tasks."}
+        if aborted == "cancelled":
+            return {"error": "Command stopped by the user."}
         return {
-            "returncode": proc.returncode,
-            "stdout": proc.stdout[:5000],
-            "stderr": proc.stderr[:2000],
-            "success": proc.returncode == 0,
+            "returncode": returncode,
+            "stdout": stdout[:5000],
+            "stderr": stderr[:2000],
+            "success": returncode == 0,
             "cwd": workspace
         }
-    except subprocess.TimeoutExpired:
-        return {"error": "Command timed out (30s limit). Use background processes for long tasks."}
     except Exception as e:
         return {"error": str(e)}
 

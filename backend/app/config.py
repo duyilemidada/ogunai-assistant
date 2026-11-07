@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # Leave blank to disable github_api tool gracefully rather than crashing.
     GITHUB_TOKEN: str = ""
 
+    SEARCH_PROVIDERS: str = "searxng,tavily,ddgs"
+    SEARXNG_URL: str = ""
+    TAVILY_BASE_URL: str = "https://api.tavily.com"
+    SEARCH_TIMEOUT: float = 8
+
     # Sandboxed directory for run_terminal. Agent writes/runs code here.
     # All relative paths in run_terminal resolve inside this directory.
     WORKSPACE_DIR: str = "./workspace"

@@ -1,5 +1,6 @@
 # backend/app/services/agents/base.py
 import json
+import threading
 from typing import Dict, Any, List, Optional, Callable
 
 from ..llm_adapter import llm_adapter as _global_adapter
@@ -7,13 +8,14 @@ from .tools import get_tool_schemas, _TOOL_REGISTRY
 from .events import emit_event, set_callback, clear_callback
 from .guards import (
     TAINTING_TOOLS, set_turn_context, get_turn_context, clear_turn_context,
-    mark_tainted, gate_tool_call, render_tool_result,
+    mark_tainted, gate_tool_call, render_tool_result, is_cancelled,
 )
 from ...database import SessionLocal
 from ...models import Episode
 
 MAX_HISTORY      = 20
 MAX_RESULT_CHARS = 2000
+STOPPED_TEXT     = "Stopped."
 
 
 class OgunAIAgent:
@@ -68,7 +70,13 @@ class OgunAIAgent:
                 lines.append(f"{who}: {m['content'][:max_chars_each]}")
         return "\n".join(lines)
 
+    def _stopped(self) -> str:
+        print(f"[{self.role_config['name']}] Stopped by user.")
+        return STOPPED_TEXT
+
     def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        if is_cancelled():
+            return {"error": "Stopped by the user before this tool ran."}
         if tool_name not in self.role_config["tools"]:
             return {
                 "error": (
@@ -100,9 +108,18 @@ class OgunAIAgent:
             print(f"  [{self.role_config['name']}] ✗ {tool_name} raised: {e}")
             return {"error": f"{tool_name} failed: {e}"}
 
-    def run(self, user_input: str, event_callback: Optional[Callable] = None) -> str:
+    def run(
+        self,
+        user_input: str,
+        event_callback: Optional[Callable] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> str:
         """
         ReAct loop. Returns the final text response.
+
+        cancel_event is how the Stop button reaches this loop. It is stored in
+        the turn context (so specialists see it too) and checked before every
+        LLM call and before every tool runs. Returns STOPPED_TEXT if set.
 
         The top-level agent (the Supervisor) opens the "turn context" that
         tracks whether this request has read untrusted content. Specialists
@@ -119,6 +136,7 @@ class OgunAIAgent:
                     self.user_id, self.conversation_id,
                     user_message=user_input,
                     recent_context=self._recent_context_for_handoff(),
+                    cancel_event=cancel_event,
                 )
                 owns_turn_context = True
 
@@ -130,6 +148,8 @@ class OgunAIAgent:
             force_text_only_next = False
 
             for i in range(max_iter):
+                if is_cancelled():
+                    return self._stopped()
                 self._trim_history()
                 print(f"[{self.role_config['name']}] Iteration {i+1}/{max_iter}")
 
@@ -145,6 +165,10 @@ class OgunAIAgent:
                 llm_response  = self.llm.invoke_with_tools(self.history, tools_for_this_call, temperature=0.4)
                 text_response = llm_response.get("text", "")
                 tool_calls    = llm_response.get("tool_calls", [])
+
+                # The LLM call can take seconds; Stop may have been pressed meanwhile.
+                if is_cancelled():
+                    return self._stopped()
 
                 print(f"  THOUGHT    : {text_response[:200]!r}")
                 print(f"  TOOL CALLS : {[tc['name'] for tc in tool_calls]}")
