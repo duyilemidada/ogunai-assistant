@@ -2,9 +2,8 @@
 @import './markdown.css';
 
 /*
-  Operator design system — warm palette with light/dark theming.
-  @theme inline: Tailwind generates utilities (bg-bg-base, text-primary, etc.)
-  that read from the CSS variables below. Swapping the variables swaps the theme.
+  Ogun AI design system. Same variable names as before, so components I have not
+  restyled keep working. New tokens are additive.
 */
 @theme inline {
   --color-bg-base: var(--bg-base);
@@ -17,6 +16,8 @@
   --color-primary-dim: var(--primary-dim);
   --color-accent: var(--accent);
   --color-accent-dim: var(--accent-dim);
+  --color-on-primary: var(--on-primary);
+  --color-code-bg: var(--code-bg);
 
   --color-text-primary: var(--text-primary);
   --color-text-muted: var(--text-muted);
@@ -26,53 +27,76 @@
   --color-error: var(--error);
   --color-warning: var(--warning);
 
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --shadow-soft: var(--shadow-soft-val);
+  --shadow-pop: var(--shadow-pop-val);
+
+  --font-sans:
+    'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    sans-serif;
+  --font-mono:
+    'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
 }
 
-/* ── DARK THEME (default) — "Ember" ───────────────────────────────────── */
+/* ── DARK — "Ember" ───────────────────────────────────────────────────── */
 :root,
 :root[data-theme='dark'] {
-  --bg-base: #17130f;
-  --bg-surface: #211b17;
-  --bg-elevated: #2b231e;
-  --bg-hover: #3a2f28;
-  --border: #3f352d;
+  --bg-base: #15110d;
+  --bg-surface: #1c1712;
+  --bg-elevated: #261f19;
+  --bg-hover: #322920;
+  --border: #372d24;
 
-  --text-primary: #f5ede0;
-  --text-muted: #a89a87;
-  --text-dim: #6b5d4e;
+  --text-primary: #f6efe4;
+  --text-muted: #b0a28f;
+  --text-dim: #76695a;
 
   --primary: #f58b36;
   --primary-dim: #7c3a0a;
-  --accent: #6b8af8;
+  --on-primary: #1d1106;
+  --accent: #7f95ff;
   --accent-dim: #1e2a6e;
 
-  --success: #22c55e;
-  --error: #ef4444;
-  --warning: #f59e0b;
+  --success: #34d399;
+  --error: #f87171;
+  --warning: #fbbf24;
+
+  --code-bg: #120f0c;
+  --shadow-soft-val:
+    0 1px 2px rgb(0 0 0 / 0.35), 0 8px 24px -12px rgb(0 0 0 / 0.55);
+  --shadow-pop-val: 0 12px 40px -8px rgb(0 0 0 / 0.65);
 }
 
-/* ── LIGHT THEME — "Parchment" ────────────────────────────────────────── */
+/* ── LIGHT — "Parchment" ──────────────────────────────────────────────── */
 :root[data-theme='light'] {
   --bg-base: #fbf8f3;
   --bg-surface: #ffffff;
   --bg-elevated: #f5efe6;
-  --bg-hover: #ede4d6;
-  --border: #e0d5c4;
+  --bg-hover: #ece3d4;
+  --border: #e3d8c7;
 
   --text-primary: #1a140e;
   --text-muted: #6b5d4e;
-  --text-dim: #a89a87;
+  --text-dim: #a29482;
 
   --primary: #d4661a;
   --primary-dim: #f5e2d0;
+  --on-primary: #ffffff;
   --accent: #3d5ae0;
   --accent-dim: #e0e5fb;
 
   --success: #16a34a;
   --error: #dc2626;
-  --warning: #d97706;
+  --warning: #b45309;
+
+  --code-bg: #f7f1e7;
+  --shadow-soft-val:
+    0 1px 2px rgb(60 40 10 / 0.06), 0 8px 24px -12px rgb(60 40 10 / 0.18);
+  --shadow-pop-val: 0 12px 40px -10px rgb(60 40 10 / 0.3);
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
 }
 
 body {
@@ -80,12 +104,23 @@ body {
   color: var(--text-primary);
   font-family: var(--font-sans);
   margin: 0;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
   transition:
     background-color 0.2s ease,
     color 0.2s ease;
 }
 
-/* Thin scrollbars — themed */
+::selection {
+  background: color-mix(in srgb, var(--primary) 35%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 70%, transparent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -99,4 +134,61 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--bg-hover);
+}
+
+/* ── Reusable pieces ──────────────────────────────────────────────────── */
+.brand-gradient {
+  background: linear-gradient(
+    135deg,
+    var(--primary),
+    color-mix(in srgb, var(--primary) 55%, #ffd29a)
+  );
+}
+
+.ambient-bg {
+  background-image:
+    radial-gradient(
+      70% 45% at 50% -8%,
+      color-mix(in srgb, var(--primary) 13%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      40% 30% at 100% 100%,
+      color-mix(in srgb, var(--accent) 7%, transparent),
+      transparent 70%
+    );
+}
+
+.bubble-user {
+  background: color-mix(in srgb, var(--primary) 11%, var(--bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
+}
+
+.glass {
+  background: color-mix(in srgb, var(--bg-base) 78%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.anim-fade-up {
+  animation: fade-up 0.32s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-fade-up {
+    animation: none;
+  }
+  * {
+    transition-duration: 0.01ms !important;
+  }
 }

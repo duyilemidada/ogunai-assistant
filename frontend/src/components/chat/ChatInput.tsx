@@ -22,6 +22,7 @@ export default function ChatInput({
   const [value, setValue] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const canSend = value.trim().length > 0
 
   const handleSend = () => {
     const trimmed = value.trim()
@@ -54,15 +55,15 @@ export default function ChatInput({
     const el = textareaRef.current
     if (el) {
       el.style.height = 'auto'
-      el.style.height = Math.min(el.scrollHeight, 160) + 'px'
+      el.style.height = Math.min(el.scrollHeight, 180) + 'px'
     }
   }
 
   return (
-    <div className="border-t border-border bg-bg-base px-4 py-3">
-      <div className="max-w-3xl mx-auto">
+    <div className="px-4 pb-4 pt-2">
+      <div className="mx-auto max-w-3xl">
         {attachments.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-2">
+          <div className="mb-2 flex flex-wrap gap-1.5">
             {attachments.map((a) => (
               <AttachedDocumentChip
                 key={a.documentId}
@@ -78,7 +79,7 @@ export default function ChatInput({
           </div>
         )}
 
-        <div className="flex items-end gap-1 bg-bg-surface border border-border rounded-xl px-2 py-2 focus-within:border-accent transition-colors">
+        <div className="flex items-end gap-1.5 rounded-2xl border border-border bg-bg-surface px-2.5 py-2 shadow-soft transition focus-within:border-primary/60 focus-within:ring-4 focus-within:ring-primary/10">
           <FileUploadButton
             onUploaded={(documentId, filename) =>
               setAttachments((prev) => [...prev, { documentId, filename }])
@@ -92,15 +93,20 @@ export default function ChatInput({
             disabled={disabled}
             rows={1}
             placeholder="Message Ogun AI..."
-            className="flex-1 bg-transparent resize-none outline-none text-text-primary text-[15px]
-                       placeholder:text-text-dim py-1.5 max-h-40 disabled:opacity-50"
+            className="max-h-44 flex-1 resize-none bg-transparent py-1.5 text-[15px] leading-relaxed text-text-primary outline-none placeholder:text-text-dim disabled:opacity-50"
           />
           <button
             onClick={disabled ? onCancel : handleSend}
-            disabled={disabled ? !onCancel : !value.trim()}
-            className="shrink-0 w-8 h-8 rounded-lg bg-primary disabled:bg-bg-elevated
-                       disabled:text-text-dim text-white flex items-center justify-center transition-colors"
+            disabled={disabled ? !onCancel : !canSend}
+            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition active:scale-95 ${
+              disabled
+                ? 'bg-text-primary text-bg-base hover:opacity-90'
+                : canSend
+                  ? 'bg-primary text-on-primary shadow-soft hover:brightness-110'
+                  : 'bg-bg-elevated text-text-dim'
+            }`}
             aria-label={disabled ? 'Stop' : 'Send message'}
+            title={disabled ? 'Stop generating' : 'Send (Enter)'}
           >
             {disabled ? (
               <svg
@@ -118,15 +124,10 @@ export default function ChatInput({
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
-                strokeWidth="2"
+                strokeWidth="2.2"
               >
                 <path
-                  d="M22 2 11 13"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-                <path
-                  d="M22 2 15 22 11 13 2 9 22 2Z"
+                  d="M12 19V5M5 12l7-7 7 7"
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 />
@@ -134,8 +135,9 @@ export default function ChatInput({
             )}
           </button>
         </div>
-        <p className="text-center text-text-dim text-[11px] mt-2">
-          Ogun AI can make mistakes. Verify important information.
+        <p className="mt-2 text-center text-[11px] text-text-dim">
+          Enter to send · Shift+Enter for a new line · Ogun AI can make
+          mistakes, so verify important information.
         </p>
       </div>
     </div>

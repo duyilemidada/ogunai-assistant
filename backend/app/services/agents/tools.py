@@ -4,8 +4,12 @@ import inspect
 import json
 import os
 import re
+import json
+import re
 import shlex
 import signal
+import types as _types
+import typing
 import subprocess
 import threading
 import time
@@ -24,6 +28,14 @@ from .guards import (
     is_sensitive_path, command_touches_secrets, build_specialist_task
 )
 from .search_providers import search as _search_web
+from .fitness_logic import (
+    injury_features, window_bounds, heuristic_injury_risk, combine_risk, risk_label,
+    model_is_trusted, injury_model_paths,
+)
+from .rec_logic import (
+    normalize_item_type, item_text, score_against_history, affinity_model_paths, affinity_model_is_trusted,
+)
+from ...models import Episode as _Episode
 from ...models import (
     UserLike, DailyNutrition, WorkoutLog, PhysicalStatus,
     Document, DocumentChunk, LearningProgress, ConversationMemory
@@ -42,6 +54,33 @@ def register_tool(name: str):
     return decorator
 
 
+_UnionType = getattr(_types, "UnionType", None)   # X | None syntax (Python 3.10+)
+
+
+def _json_schema_for(annotation) -> Dict[str, Any]:
+    """
+    Maps a Python annotation to a JSON-schema fragment.
+    The old check (`py_type in (Dict, dict)`) never matched Dict[str, Any] or
+    Optional[int], so those were advertised to the model as plain strings and
+    the model then sent strings (a metadata *string* where the tool calls
+    metadata.get(...), "7" where it compares energy_level <= 10).
+    """
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin is typing.Union or (_UnionType is not None and origin is _UnionType):
+        non_none = [a for a in args if a is not type(None)]
+        return _json_schema_for(non_none[0]) if len(non_none) == 1 else {"type": "string"}
+    if annotation is bool:
+        return {"type": "boolean"}
+    if annotation in (int, float):
+        return {"type": "number"}
+    if annotation is dict or origin is dict:
+        return {"type": "object"}
+    if annotation is list or origin is list:
+        return {"type": "array", "items": _json_schema_for(args[0]) if args else {"type": "object"}}
+    return {"type": "string"}
+
+
 def get_tool_schemas(tool_names: List[str]) -> List[Dict[str, Any]]:
     """Generates OpenAI-compatible tool schemas from registered function signatures."""
     schemas = []
@@ -57,16 +96,7 @@ def get_tool_schemas(tool_names: List[str]) -> List[Dict[str, Any]]:
             # user_id and db are injected at runtime — hide from the LLM
             if param_name in ('user_id', 'db'):
                 continue
-            py_type = param.annotation
-            json_type = "string"
-            if py_type in (int, float):
-                json_type = "number"
-            elif py_type is bool:
-                json_type = "boolean"
-            elif py_type in (Dict, dict):
-                json_type = "object"
-
-            properties[param_name] = {"type": json_type}
+            properties[param_name] = _json_schema_for(param.annotation)
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
@@ -920,69 +950,137 @@ def browse_authenticated(url: str, login_url: str, username: str, password: str)
 
 # ─── Recommender ─────────────────────────────────────────────────────────────
 
-@register_tool("predict_affinity")
-def predict_affinity(item_type: str, metadata: Dict[str, Any], user_id: int) -> Dict[str, Any]:
-    """Predicts how much the user will like an item. Uses XGBoost model if trained, else cosine similarity."""
-    title = metadata.get("title", "")
-    desc = metadata.get("description", "")
-    cand_emb = get_embedder().encode(f"{title} {desc}").astype(np.float32)
-
-    # Feature vector: embedding (384) + 3 scalar metadata fields = 387 dims.
-    # Must match what train_affinity_model.py produces at training time.
-    features = np.hstack([
-        cand_emb,
-        [
-            float(metadata.get("price", 0)),
-            float(metadata.get("rating", 0)),
-            float(metadata.get("year", 2000))
-        ]
-    ]).reshape(1, -1)
-
-    model_path = os.path.join(settings.ML_MODELS_DIR, "affinity_model.pkl")
-    if os.path.exists(model_path):
+def _as_candidate(meta: Any) -> Dict[str, Any]:
+    """Tolerate the model sending a JSON string or a bare title instead of an object."""
+    if isinstance(meta, str):
         try:
-            import joblib
-            pipeline = joblib.load(model_path)
-            prob = float(pipeline.predict_proba(features)[0][1])
-            return {
-                "affinity_score": round(prob, 2),
-                "confidence": "high" if prob > 0.7 else "medium" if prob > 0.4 else "low",
-                "reason": "XGBoost model prediction based on past likes and feedback.",
-                "model": "xgboost"
-            }
-        except Exception as e:
-            print(f"[predict_affinity] XGBoost load failed ({e}). Falling back to cosine.")
+            parsed = json.loads(meta)
+            meta = parsed if isinstance(parsed, dict) else {"title": meta}
+        except ValueError:
+            meta = {"title": meta}
+    return meta if isinstance(meta, dict) else {}
 
-    # Fallback: cosine similarity against liked items in DB
+
+def _is_false(v: Any) -> bool:
+    return v is False or str(v).strip().lower() in ("false", "no", "0", "dislike", "disliked")
+
+
+def _affinity_history(db, user_id: int, wanted_type: str):
+    """(liked, disliked) as lists of (title, embedding) for this user and item type."""
+    liked = []
+    for row in db.query(UserLike).filter(UserLike.user_id == user_id).all():
+        if normalize_item_type(row.item_type) == wanted_type and row.embedding is not None:
+            liked.append((row.title, np.frombuffer(row.embedding, dtype=np.float32)))
+    # Rejections live in the audit log: every record_preference call is stored as an
+    # Episode with its arguments (including the injected user_id).
+    rejected = []
+    for ep in db.query(_Episode).filter(_Episode.action == "record_preference").all():
+        m = ep.meta_data or {}
+        if m.get("user_id") == user_id and _is_false(m.get("liked")) \
+                and normalize_item_type(m.get("item_type")) == wanted_type and item_text(m):
+            rejected.append((m.get("title", ""), item_text(m)))
+    disliked = []
+    if rejected:
+        embs = get_embedder().encode([t for _, t in rejected])
+        disliked = [(title, np.asarray(e, dtype=np.float32)) for (title, _), e in zip(rejected, embs)]
+    return liked, disliked
+
+
+def _trusted_affinity_model(user_id: int, wanted_type: str):
+    pkl, meta_path = affinity_model_paths(settings.ML_MODELS_DIR, user_id)
+    if not (os.path.exists(pkl) and os.path.exists(meta_path)):
+        return None
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if not affinity_model_is_trusted(meta, wanted_type):
+            return None
+        import joblib
+        return joblib.load(pkl)
+    except Exception as e:
+        print(f"[affinity] model unusable ({e}); using similarity.")
+        return None
+
+
+def _score_items(item_type: str, metas: List[Dict[str, Any]], user_id: int):
+    wanted = normalize_item_type(item_type)
+    embs = np.asarray(get_embedder().encode([item_text(m) for m in metas]), dtype=np.float32)
+    model = _trusted_affinity_model(user_id, wanted)
     db = SessionLocal()
     try:
-        liked = db.query(UserLike).filter(
-            UserLike.user_id == user_id,
-            UserLike.item_type == item_type
-        ).all()
+        liked, disliked = _affinity_history(db, user_id, wanted)
+    finally:
+        db.close()
+    out = []
+    for meta, emb in zip(metas, embs):
+        if model is not None:
+            prob = float(model.predict_proba(emb.reshape(1, -1))[0][1])
+            res = {"affinity_score": round(prob, 2), "confidence": "high" if prob > 0.7 else "medium" if prob > 0.4 else "low",
+                   "reason": "Trained model, built from your likes and rejections.", "model": "xgboost"}
+        else:
+            res = score_against_history(emb, liked, disliked)
+        res["title"] = meta.get("title", "")
+        out.append(res)
+    return out, len(liked), len(disliked)
 
-        if not liked:
-            return {
-                "affinity_score": 0.5,
-                "confidence": "low",
-                "reason": "No past likes yet. Rate items so the system can learn.",
-                "model": "no_data"
-            }
 
-        similarities = []
-        for item in liked:
-            item_emb = np.frombuffer(item.embedding, dtype=np.float32)
-            norm = np.linalg.norm(cand_emb) * np.linalg.norm(item_emb)
-            sim = float(np.dot(cand_emb, item_emb) / norm) if norm > 0 else 0.0
-            similarities.append((sim, item.title))
+@register_tool("predict_affinity")
+def predict_affinity(item_type: str, metadata: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    """Scores ONE item (0 to 1) from the user's past likes and rejections. Use score_candidates for several items."""
+    meta = _as_candidate(metadata)
+    if not item_text(meta):
+        return {"error": "metadata needs at least a title (and ideally a description)."}
+    results, n_liked, n_disliked = _score_items(item_type, [meta], user_id)
+    return {**results[0], "based_on": {"liked": n_liked, "rejected": n_disliked}}
 
-        max_sim, best_match = max(similarities, key=lambda x: x[0])
-        return {
-            "affinity_score": round(max_sim, 2),
-            "confidence": "high" if max_sim > 0.7 else "medium" if max_sim > 0.5 else "low",
-            "reason": f"Similar to '{best_match}' which you liked.",
-            "model": "cosine_similarity"
-        }
+
+@register_tool("score_candidates")
+def score_candidates(item_type: str, candidates: List[Dict[str, Any]], user_id: int) -> Dict[str, Any]:
+    """Scores several candidate items at once (each with title and description) and returns them ranked best first."""
+    if not isinstance(candidates, list) or not candidates:
+        return {"error": "candidates must be a non-empty list of {title, description} objects."}
+    metas = [m for m in (_as_candidate(c) for c in candidates[:10]) if item_text(m)]
+    if not metas:
+        return {"error": "Each candidate needs at least a title."}
+    results, n_liked, n_disliked = _score_items(item_type, metas, user_id)
+    ranked = sorted(results, key=lambda r: r["affinity_score"], reverse=True)
+    return {"item_type": item_type, "ranked": ranked, "based_on": {"liked": n_liked, "rejected": n_disliked},
+            "note": "Low confidence means little history yet, not a bad item."}
+
+
+@register_tool("record_preference")
+def record_preference(item_type: str, title: str, liked: bool, user_id: int, description: Optional[str] = None) -> Dict[str, Any]:
+    """Records that the user liked or rejected an item, so future recommendations improve."""
+    title = (title or "").strip()
+    if not title:
+        return {"error": "title is required."}
+    is_like = not _is_false(liked)
+    wanted = normalize_item_type(item_type)
+    text = f"{title} {description or ''}".strip()
+    emb = np.asarray(get_embedder().encode(text), dtype=np.float32)
+
+    db = SessionLocal()
+    try:
+        existing = [r for r in db.query(UserLike).filter(UserLike.user_id == user_id).all()
+                    if normalize_item_type(r.item_type) == wanted and (r.title or "").strip().lower() == title.lower()]
+        if is_like:
+            if existing:
+                return {"recorded": "like", "title": title, "message": "Already in your likes."}
+            cols = UserLike.__table__.columns.keys()
+            kwargs = {"user_id": user_id, "item_type": wanted, "title": title, "embedding": emb.tobytes()}
+            if "description" in cols and description:
+                kwargs["description"] = description
+            db.add(UserLike(**kwargs))
+            db.commit()
+            return {"recorded": "like", "title": title, "message": "Saved. I will weight similar items higher."}
+        for r in existing:                                  # changed their mind: a rejection removes the like
+            db.delete(r)
+        db.commit()
+        # The rejection itself is stored by the audit log (Episode) when this call finishes.
+        return {"recorded": "rejection", "title": title, "message": "Noted. I will steer away from similar items."}
+    except Exception as e:
+        db.rollback()
+        return {"error": f"Could not save preference: {e}"}
     finally:
         db.close()
 
@@ -1360,77 +1458,24 @@ def ask_document(document_id: int, question: str, user_id: int) -> Dict[str, Any
 
 def _build_injury_features(user_id: int):
     """
-    8-feature vector over the past 7 days. Must match train_injury_model.py exactly.
-    Returns (features_list, summary_dict) or (None, summary_dict) if data is insufficient.
+    8-feature vector over the last 7 days (today inclusive). The maths lives in
+    fitness_logic.injury_features, which the trainer also uses, so training and
+    serving can no longer drift apart.
     """
     db = SessionLocal()
     try:
         today = dt.date.today()
-        week_ago = today - dt.timedelta(days=7)
-
-        workouts = db.query(WorkoutLog).filter(
-            WorkoutLog.user_id == user_id,
-            WorkoutLog.date >= week_ago
-        ).all()
-
-        statuses = db.query(PhysicalStatus).filter(
-            PhysicalStatus.user_id == user_id,
-            PhysicalStatus.date >= week_ago
-        ).all()
-
-        if not workouts and not statuses:
-            return None, {"days_logged": 0}
-
-        training_days = len(set(w.date for w in workouts))
-        total_volume = sum(w.sets * w.reps * w.load_kg for w in workouts)
-        rpe_values = [w.rpe for w in workouts if w.rpe is not None]
-        avg_rpe = float(np.mean(rpe_values)) if rpe_values else 5.0
-        max_rpe = float(max(rpe_values)) if rpe_values else 5.0
-        avg_sleep = float(np.mean([s.sleep_hours for s in statuses])) if statuses else 7.0
-        pain_values = [s.pain_level for s in statuses]
-        avg_pain = float(np.mean(pain_values)) if pain_values else 0.0
-        max_pain = float(max(pain_values)) if pain_values else 0.0
-        low_sleep_days = float(sum(1 for s in statuses if s.sleep_hours < 6.0))
-
-        features = [training_days, total_volume, avg_rpe, max_rpe,
-                    avg_sleep, avg_pain, max_pain, low_sleep_days]
-        summary = {
-            "training_days_last_7": training_days,
-            "total_volume_kg": round(total_volume, 1),
-            "avg_rpe": round(avg_rpe, 1),
-            "avg_sleep_hours": round(avg_sleep, 1),
-            "avg_pain_level": round(avg_pain, 1),
-            "max_pain_level": round(max_pain, 1),
-            "status_days_logged": len(statuses)
-        }
-        return features, summary
+        start, _ = window_bounds(today)
+        workouts = db.query(WorkoutLog).filter(WorkoutLog.user_id == user_id, WorkoutLog.date >= start).all()
+        statuses = db.query(PhysicalStatus).filter(PhysicalStatus.user_id == user_id, PhysicalStatus.date >= start).all()
+        return injury_features(workouts, statuses, today)
     finally:
         db.close()
 
 
 def _heuristic_injury_risk(summary: dict) -> float:
-    """Evidence-based rule engine used before the XGBoost model has enough data."""
-    risk = 0.0
-    if summary.get("training_days_last_7", 0) >= 6:
-        risk += 0.30
-    elif summary.get("training_days_last_7", 0) >= 5:
-        risk += 0.10
-    avg_rpe = summary.get("avg_rpe", 0)
-    if avg_rpe >= 8.5:
-        risk += 0.25
-    elif avg_rpe >= 7.0:
-        risk += 0.10
-    avg_sleep = summary.get("avg_sleep_hours", 8)
-    if avg_sleep < 6.0:
-        risk += 0.25
-    elif avg_sleep < 7.0:
-        risk += 0.10
-    avg_pain = summary.get("avg_pain_level", 0)
-    if avg_pain >= 5.0:
-        risk += 0.30
-    elif avg_pain >= 3.0:
-        risk += 0.15
-    return min(risk, 1.0)
+    """Rule engine used when there is no trusted model (see fitness_logic.heuristic_injury_risk)."""
+    return heuristic_injury_risk(summary)
 
 
 def _get_injury_recommendation(risk: float) -> str:
@@ -1446,12 +1491,46 @@ def _get_injury_recommendation(risk: float) -> str:
 
 # ─── Fitness Tools ────────────────────────────────────────────────────────────
 
+def _usda_per_100g(food: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """
+    Nutrient values from /foods/search are ALWAYS per 100 g, for every data
+    type including Branded (servingSize is a separate field). Returns None if
+    the entry has no usable energy value or the numbers are not physically
+    plausible (USDA branded data contains a few absurd rows).
+    """
+    by_id = {n.get("nutrientId"): n.get("value") for n in food.get("foodNutrients", []) if n.get("value") is not None}
+    calories = by_id.get(USDA_NUTRIENT_IDS["calories"])
+    if calories is None:                                   # Foundation Foods report Atwater energy instead
+        calories = by_id.get(2047, by_id.get(2048))
+    if calories is None:
+        return None
+    per = {
+        "calories": float(calories),
+        "protein": float(by_id.get(USDA_NUTRIENT_IDS["protein"], 0)),
+        "carbs":   float(by_id.get(USDA_NUTRIENT_IDS["carbs"], 0)),
+        "fat":     float(by_id.get(USDA_NUTRIENT_IDS["fat"], 0)),
+        "fiber":   float(by_id.get(USDA_NUTRIENT_IDS["fiber"], 0)),
+    }
+    if not 0 <= per["calories"] <= 900:                    # pure fat is about 884 kcal per 100 g
+        return None
+    if per["protein"] + per["carbs"] + per["fat"] > 105:   # cannot exceed 100 g of food per 100 g
+        return None
+    return per
+
+
 @register_tool("log_nutrition")
 def log_nutrition(food_name: str, portion_grams: float, user_id: int) -> Dict[str, Any]:
     """
     Logs a food item's macros from USDA FoodData Central. Use generic names like
     'chicken breast cooked', 'white rice cooked', or 'oats dry' for best matches.
     """
+    try:
+        portion_grams = float(portion_grams)
+    except (TypeError, ValueError):
+        return {"error": "portion_grams must be a number of grams, e.g. 150."}
+    if not 0 < portion_grams <= 3000:
+        return {"error": "portion_grams must be between 1 and 3000. Convert pieces to grams first (1 large egg is about 50 g)."}
+
     def _usda_search(data_types: Optional[str] = None) -> list:
         params: Dict[str, Any] = {
             "query": food_name,
@@ -1465,7 +1544,7 @@ def log_nutrition(food_name: str, portion_grams: float, user_id: int) -> Dict[st
         return resp.json().get("foods", [])
 
     try:
-        # Foundation Foods and SR Legacy are standardised per 100g — prefer these
+        # Foundation Foods and SR Legacy are lab-analysed generic foods — prefer these
         foods = _usda_search("Foundation Foods,SR Legacy")
         if not foods:
             foods = _usda_search()  # Fall back to branded foods
@@ -1477,23 +1556,21 @@ def log_nutrition(food_name: str, portion_grams: float, user_id: int) -> Dict[st
                 )
             }
 
-        food = foods[0]
-        nutrients_by_id = {
-            n["nutrientId"]: n.get("value", 0)
-            for n in food.get("foodNutrients", [])
-        }
+        food, per100 = None, None
+        for candidate in foods:                            # first entry with sane numbers, not blindly foods[0]
+            per100 = _usda_per_100g(candidate)
+            if per100:
+                food = candidate
+                break
+        if food is None:
+            return {"error": f"USDA results for '{food_name}' had no usable nutrition data. Try a more specific name."}
 
-        base_size_g = food.get("servingSize", 100)
-        serving_unit = food.get("servingSizeUnit", "g").lower()
-        if serving_unit not in ("g", "gram", "grams"):
-            base_size_g = 100  # Fall back to 100g if unit is unexpected
-        scale = portion_grams / base_size_g
-
-        calories = round(nutrients_by_id.get(USDA_NUTRIENT_IDS["calories"], 0) * scale, 1)
-        protein  = round(nutrients_by_id.get(USDA_NUTRIENT_IDS["protein"],  0) * scale, 1)
-        carbs    = round(nutrients_by_id.get(USDA_NUTRIENT_IDS["carbs"],    0) * scale, 1)
-        fat      = round(nutrients_by_id.get(USDA_NUTRIENT_IDS["fat"],      0) * scale, 1)
-        fiber    = round(nutrients_by_id.get(USDA_NUTRIENT_IDS["fiber"],    0) * scale, 1)
+        scale = portion_grams / 100.0                      # values are per 100 g, always
+        calories = round(per100["calories"] * scale, 1)
+        protein  = round(per100["protein"] * scale, 1)
+        carbs    = round(per100["carbs"] * scale, 1)
+        fat      = round(per100["fat"] * scale, 1)
+        fiber    = round(per100["fiber"] * scale, 1)
 
     except httpx.HTTPStatusError as e:
         return {"error": f"USDA API {e.response.status_code}: {e.response.text}"}
@@ -1513,9 +1590,11 @@ def log_nutrition(food_name: str, portion_grams: float, user_id: int) -> Dict[st
         db.commit()
         return {
             "logged": food.get("description", food_name),
+            "matched_data_type": food.get("dataType"),
             "portion_grams": portion_grams,
             "calories": calories, "protein_grams": protein,
             "carb_grams": carbs, "fat_grams": fat, "fiber_grams": fiber,
+            "per_100g": {k: round(v, 1) for k, v in per100.items()},
             "source": "USDA FoodData Central"
         }
     except Exception as e:
@@ -1607,7 +1686,14 @@ def log_physical_status(
     """
     Logs today's physical status. This data trains the injury prediction model.
     pain_level: 0 (none) to 10 (severe). sleep_hours: hours slept last night.
+    Logging again on the same day updates today's entry (worst pain of the day is kept).
     """
+    try:
+        pain_level = int(pain_level)
+        sleep_hours = float(sleep_hours)
+        energy_level = None if energy_level is None or energy_level == "" else int(energy_level)
+    except (TypeError, ValueError):
+        return {"error": "pain_level, sleep_hours and energy_level must be numbers."}
     if not 0 <= pain_level <= 10:
         return {"error": "pain_level must be 0–10."}
     if not 0 < sleep_hours <= 24:
@@ -1617,11 +1703,27 @@ def log_physical_status(
 
     db = SessionLocal()
     try:
-        db.add(PhysicalStatus(
-            user_id=user_id, date=dt.date.today(),
-            pain_level=pain_level, injury_site=injury_site,
-            sleep_hours=sleep_hours, energy_level=energy_level, notes=notes
-        ))
+        today = dt.date.today()
+        row = db.query(PhysicalStatus).filter(
+            PhysicalStatus.user_id == user_id, PhysicalStatus.date == today
+        ).first()
+        updated = row is not None
+        if row:
+            row.pain_level = max(row.pain_level or 0, pain_level)   # keep the worst pain of the day
+            row.sleep_hours = sleep_hours
+            if injury_site:
+                row.injury_site = injury_site
+            if energy_level is not None:
+                row.energy_level = energy_level
+            if notes:
+                row.notes = f"{row.notes} | {notes}" if row.notes else notes
+            pain_level = row.pain_level
+        else:
+            db.add(PhysicalStatus(
+                user_id=user_id, date=today,
+                pain_level=pain_level, injury_site=injury_site,
+                sleep_hours=sleep_hours, energy_level=energy_level, notes=notes
+            ))
         db.commit()
         warning = ""
         if pain_level >= 7:
@@ -1631,7 +1733,7 @@ def log_physical_status(
         if sleep_hours < 6:
             warning += " 🔴 Sub-6h sleep significantly elevates injury risk."
         return {
-            "logged": True, "pain_level": pain_level,
+            "logged": True, "updated_existing_entry": updated, "pain_level": pain_level,
             "sleep_hours": sleep_hours, "energy_level": energy_level,
             "message": f"Physical status logged.{warning}"
         }
@@ -1641,121 +1743,61 @@ def log_physical_status(
     finally:
         db.close()
 
+# Movements available with a barbell and bench only (no rack, cables or machines).
+_SAFE_BY_SITE = {
+    "shoulder": ["Romanian deadlift", "conventional deadlift", "Zercher squat"],
+    "knee":     ["Romanian deadlift", "bench press", "overhead press (seated)", "barbell curl",
+                 "single-arm behind-the-neck tricep extension"],
+    "back":     ["bench press", "barbell curl", "single-arm behind-the-neck tricep extension"],
+    "wrist":    ["Romanian deadlift", "conventional deadlift", "Zercher squat"],
+    "elbow":    ["Romanian deadlift", "conventional deadlift"],
+    "hip":      ["bench press", "overhead press (seated)", "barbell curl",
+                 "single-arm behind-the-neck tricep extension"],
+    "ankle":    ["bench press", "overhead press (seated)", "barbell curl",
+                 "single-arm behind-the-neck tricep extension"],
+}
+_SITE_WORDS = {
+    "shoulder": ["shoulder", "rotator", "deltoid"], "knee": ["knee", "patella"],
+    "back": ["back", "spine", "lumbar"], "wrist": ["wrist"], "elbow": ["elbow"],
+    "hip": ["hip", "glute"], "ankle": ["ankle"],
+}
+_SITE_CAUTION = {
+    "shoulder": "Skip the split squat: cleaning the bar to the front rack loads the shoulder. Keep pulls light until pain is below 3.",
+    "back": "Do pressing seated or lying; no standing overhead work.",
+    "wrist": "Use straps on pulls; Zercher keeps the wrists out of the lift.",
+    "elbow": "Zercher puts the bar in the elbow crook, so it is excluded. Keep deadlifts light and use straps.",
+}
+
+
 @register_tool("adjust_program")
 def adjust_program(injury_site: str, current_exercise: str) -> Dict[str, Any]:
     """
-    Finds safe exercise alternatives for an injured body part.
-    Alternatives are constrained to barbell-only home gym equipment
-    (bench, barbell, cement plates — no rack, cables, or machines).
-    injury_site examples: 'shoulder', 'knee', 'lower back', 'wrist', 'elbow'.
+    Finds safe barbell-and-bench alternatives for an injured body part.
+    injury_site examples: 'shoulder', 'knee', 'lower back', 'wrist', 'elbow'. Several sites can be named.
     """
-    # Each entry maps an injury to movements that avoid loading that structure.
-    # All alternatives are drawable from: Zercher squat, barbell split squat,
-    # Romanian deadlift, conventional deadlift, bench press, overhead press,
-    # barbell curl, single-arm behind-neck tricep extension.
-    safe_search_map = {
-        "shoulder": [
-            # Shoulder injured → all lower body, no pressing
-            "romanian deadlift",
-            "barbell deadlift",
-            "barbell lunge",        # wger approximates split squat
-            "zercher squat"
-        ],
-        "knee": [
-            # Knee injured → hip hinges + upper body, no knee-dominant squat patterns
-            "romanian deadlift",
-            "bench press",
-            "overhead press",
-            "barbell curl"
-        ],
-        "back": [
-            # Lower back → upper body only, avoid spinal loading
-            "bench press",
-            "overhead press",
-            "barbell curl"
-        ],
-        "wrist": [
-            # Wrist injured → movements where wrist is neutral or not loaded
-            # Zercher uses the crook of the elbows so wrist-friendly
-            "romanian deadlift",
-            "barbell deadlift",
-            "zercher squat"
-        ],
-        "elbow": [
-            # Elbow injured → no curl or tricep extension, lower body focus
-            "romanian deadlift",
-            "barbell deadlift",
-            "barbell lunge",
-            "zercher squat"
-        ],
-        "hip": [
-            # Hip injured → upper body + exercises with minimal hip load
-            "bench press",
-            "overhead press",
-            "barbell curl"
-        ],
-        "ankle": [
-            # Ankle injured → seated/lying upper body + hip hinge (minimal ankle stress)
-            "bench press",
-            "overhead press",
-            "romanian deadlift",
-            "barbell curl"
-        ],
-    }
+    text = (injury_site or "").lower()
+    sites = [s for s, words in _SITE_WORDS.items() if any(re.search(rf"\b{w}", text) for w in words)]
+    base = {"injury_site": injury_site, "replaced_exercise": current_exercise,
+            "equipment_constraint": "Barbell + bench only. No rack, cables, or machines.",
+            "source": "Vetted offline list (no external lookup)"}
 
-    injury_lower = injury_site.lower()
-    search_terms = None
-    for keyword, terms in safe_search_map.items():
-        if keyword in injury_lower:
-            search_terms = terms
-            break
+    if not sites:
+        return {**base, "alternatives": [],
+                "note": f"I do not recognise '{injury_site}'. Ask the user exactly where it hurts. Until then keep to rest or very light "
+                        "movement, and see a physio if it persists. Known sites: " + ", ".join(_SAFE_BY_SITE) + "."}
 
-    # If injury site not in map, default to upper body only (conservative)
-    if not search_terms:
-        search_terms = ["bench press", "barbell curl", "romanian deadlift"]
-
-    alternatives: List[str] = []
-
-    # Query wger for exercise descriptions and cues — useful context even if
-    # names differ slightly from what we call them
-    for term in search_terms[:3]:
-        try:
-            resp = httpx.get(
-                f"{settings.WGER_BASE_URL}/exercise/search/",
-                params={"term": term, "language": "english", "format": "json"},
-                timeout=8
-            )
-            if resp.status_code == 200:
-                for suggestion in resp.json().get("suggestions", [])[:2]:
-                    name = suggestion.get("value", "")
-                    if name and name not in alternatives:
-                        alternatives.append(name)
-        except Exception:
-            pass
-
-    # Fallback: use the actual exercise names from Israel's available list.
-    # These are always valid regardless of wger availability.
-    if not alternatives:
-        alternatives = search_terms
-
-    return {
-        "injury_site": injury_site,
-        "replaced_exercise": current_exercise,
-        "alternatives": alternatives[:6],
-        "equipment_constraint": "Barbell + bench only. No rack, cables, or machines.",
-        "source": "wger Exercise Database (with equipment constraints applied)",
-        "note": (
-            f"All alternatives avoid loading {injury_site} and are executable "
-            "with a barbell and bench. "
-            "For the shoulder specifically: stick to lower body until pain_level < 3. "
-            "Consult a physio for persistent shoulder issues."
-        )
-    }
+    # With several injured sites, only movements safe for ALL of them qualify.
+    safe = [m for m in _SAFE_BY_SITE[sites[0]] if all(m in _SAFE_BY_SITE[s] for s in sites[1:])]
+    cautions = [_SITE_CAUTION[s] for s in sites if s in _SITE_CAUTION]
+    note = ("Conservative defaults, not medical advice. See a physio if pain persists. " + " ".join(cautions)).strip()
+    if not safe:
+        note = f"No vetted barbell movement avoids all of: {', '.join(sites)}. Rest or physio advice is the safe call. " + note
+    return {**base, "injury_sites_matched": sites, "alternatives": safe, "note": note}
 
 
 @register_tool("predict_injury_risk")
 def predict_injury_risk(user_id: int) -> Dict[str, Any]:
-    """Predicts injury risk from last 7 days of training and recovery. Uses XGBoost if trained, else heuristics."""
+    """Predicts injury risk from the last 7 days of training and recovery. Uses a trained model only if it is trustworthy, else rules."""
     features, summary = _build_injury_features(user_id)
 
     if features is None:
@@ -1765,31 +1807,37 @@ def predict_injury_risk(user_id: int) -> Dict[str, Any]:
             "days_logged": summary.get("days_logged", 0)
         }
 
-    model_path = os.path.join(settings.ML_MODELS_DIR, "injury_model.pkl")
-    if os.path.exists(model_path):
+    model_prob = None
+    model_note = None
+    pkl, meta_path = injury_model_paths(settings.ML_MODELS_DIR, user_id)
+    if os.path.exists(pkl) and os.path.exists(meta_path):
         try:
-            import joblib
-            pipeline = joblib.load(model_path)
-            prob = float(pipeline.predict_proba([features])[0][1])
-            return {
-                "risk_probability": round(prob, 2),
-                "risk": "high" if prob > 0.7 else "moderate" if prob > 0.4 else "low",
-                "recommendation": _get_injury_recommendation(prob),
-                "model": "xgboost",
-                "training_summary": summary
-            }
+            with open(meta_path) as f:
+                meta = json.load(f)
+            if model_is_trusted(meta):
+                import joblib
+                model_prob = float(joblib.load(pkl).predict_proba([features])[0][1])
+            else:
+                model_note = "A trained model exists but was judged too weak to use yet (too little data or low accuracy)."
         except Exception as e:
-            print(f"[predict_injury_risk] XGBoost failed ({e}). Using heuristic.")
+            print(f"[predict_injury_risk] model unusable ({e}). Using rules.")
 
-    risk_score = _heuristic_injury_risk(summary)
-    return {
-        "risk_probability": round(risk_score, 2),
-        "risk": "high" if risk_score > 0.7 else "moderate" if risk_score > 0.4 else "low",
-        "recommendation": _get_injury_recommendation(risk_score),
-        "model": "heuristic",
+    # The model may raise risk but never push it below the hard pain rule.
+    risk, source = combine_risk(model_prob, summary)
+    out = {
+        "risk_probability": round(risk, 2),
+        "risk": risk_label(risk),
+        "recommendation": _get_injury_recommendation(risk),
+        "model": source,
         "training_summary": summary,
-        "note": "Run `python -m ml.train_injury_model` after 30+ days of logs to activate XGBoost."
     }
+    if summary.get("data_notes"):
+        out["data_notes"] = summary["data_notes"]
+    if model_note:
+        out["note"] = model_note
+    elif model_prob is None:
+        out["note"] = "Rule-based estimate. Run `python -m ml.train_injury_model --user-id N` after 30+ logged days."
+    return out
 
 
 # ─── Orchestration ────────────────────────────────────────────────────────────

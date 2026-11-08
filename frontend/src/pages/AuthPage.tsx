@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom'
 import { login, register } from '../api/auth'
 import { useAuthStore } from '../stores/authStore'
 
+const inputClass =
+  'w-full rounded-xl border border-border bg-bg-elevated px-3.5 py-2.5 text-sm text-text-primary outline-none transition placeholder:text-text-dim focus:border-primary/60 focus:ring-4 focus:ring-primary/10'
+
 export default function AuthPage() {
   const [mode, setMode] = useState<'login' | 'register'>('login')
   const [email, setEmail] = useState('')
@@ -42,39 +45,43 @@ export default function AuthPage() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-bg-base px-4">
-      <div className="w-full max-w-sm">
-        <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-text-primary tracking-tight">
+    <div className="ambient-bg flex min-h-screen items-center justify-center bg-bg-base px-4">
+      <div className="anim-fade-up w-full max-w-sm">
+        <div className="mb-8 text-center">
+          <div className="brand-gradient mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl shadow-pop">
+            <span className="text-xl font-bold text-on-primary">O</span>
+          </div>
+          <h1 className="text-2xl font-semibold tracking-tight text-text-primary">
             Ogun AI
           </h1>
-          <p className="text-text-muted text-sm mt-1">
-            {mode === 'login' ? 'Sign in to continue' : 'Create your account'}
+          <p className="mt-1 text-sm text-text-muted">
+            {mode === 'login'
+              ? 'Welcome back. Sign in to continue.'
+              : 'Create your account.'}
           </p>
         </div>
 
         <form
           onSubmit={handleSubmit}
-          className="bg-bg-surface border border-border rounded-xl p-6 space-y-4"
+          className="space-y-4 rounded-2xl border border-border bg-bg-surface p-6 shadow-pop"
         >
           {mode === 'register' && (
             <div>
-              <label className="block text-xs text-text-muted mb-1.5">
+              <label className="mb-1.5 block text-xs font-medium text-text-muted">
                 Full name (optional)
               </label>
               <input
                 type="text"
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
-                className="w-full bg-bg-elevated border border-border rounded-lg px-3 py-2
-                           text-text-primary text-sm focus:outline-none focus:border-accent"
-                placeholder="Israel Duyilemi"
+                className={inputClass}
+                placeholder="Your name"
               />
             </div>
           )}
 
           <div>
-            <label className="block text-xs text-text-muted mb-1.5">
+            <label className="mb-1.5 block text-xs font-medium text-text-muted">
               Email
             </label>
             <input
@@ -82,14 +89,13 @@ export default function AuthPage() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full bg-bg-elevated border border-border rounded-lg px-3 py-2
-                         text-text-primary text-sm focus:outline-none focus:border-accent"
+              className={inputClass}
               placeholder="you@example.com"
             />
           </div>
 
           <div>
-            <label className="block text-xs text-text-muted mb-1.5">
+            <label className="mb-1.5 block text-xs font-medium text-text-muted">
               Password
             </label>
             <input
@@ -98,14 +104,13 @@ export default function AuthPage() {
               minLength={8}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full bg-bg-elevated border border-border rounded-lg px-3 py-2
-                         text-text-primary text-sm focus:outline-none focus:border-accent"
-              placeholder="••••••••"
+              className={inputClass}
+              placeholder="At least 8 characters"
             />
           </div>
 
           {error && (
-            <div className="text-error text-xs bg-error/10 border border-error/30 rounded-lg px-3 py-2">
+            <div className="rounded-xl border border-error/30 bg-error/10 px-3 py-2 text-xs text-error">
               {error}
             </div>
           )}
@@ -113,8 +118,7 @@ export default function AuthPage() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full bg-primary hover:bg-primary/90 disabled:opacity-50
-                       text-white font-medium text-sm rounded-lg py-2.5 transition-colors"
+            className="brand-gradient w-full rounded-xl py-2.5 text-sm font-semibold text-on-primary shadow-soft transition hover:brightness-110 active:scale-[0.99] disabled:opacity-50"
           >
             {loading
               ? 'Please wait...'
@@ -124,7 +128,7 @@ export default function AuthPage() {
           </button>
         </form>
 
-        <p className="text-center text-text-muted text-xs mt-4">
+        <p className="mt-5 text-center text-xs text-text-muted">
           {mode === 'login'
             ? "Don't have an account? "
             : 'Already have an account? '}
@@ -134,7 +138,7 @@ export default function AuthPage() {
               setMode(mode === 'login' ? 'register' : 'login')
               setError(null)
             }}
-            className="text-accent hover:underline"
+            className="font-medium text-accent hover:underline"
           >
             {mode === 'login' ? 'Register' : 'Sign in'}
           </button>

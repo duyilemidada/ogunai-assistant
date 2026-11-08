@@ -2,14 +2,14 @@ import { NavLink } from 'react-router-dom'
 
 export default function NavRail() {
   const linkClass = ({ isActive }: { isActive: boolean }) =>
-    `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors ${
+    `flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
       isActive
         ? 'bg-bg-elevated text-text-primary'
         : 'text-text-muted hover:bg-bg-hover hover:text-text-primary'
     }`
 
   return (
-    <nav className="flex flex-col gap-0.5 px-3 py-2 border-t border-border">
+    <nav className="flex flex-col gap-0.5 border-t border-border px-3 py-2">
       <NavLink to="/chat" className={linkClass}>
         <svg
           width="16"

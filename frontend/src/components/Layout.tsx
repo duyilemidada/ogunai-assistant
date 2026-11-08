@@ -9,28 +9,27 @@ export default function Layout({ children }: { children: ReactNode }) {
   const toggleSidebar = useUiStore((s) => s.toggleSidebar)
 
   return (
-    <div className="flex h-screen bg-bg-base overflow-hidden relative">
+    <div className="relative flex h-screen overflow-hidden bg-bg-base">
       {/* Mobile backdrop — tapping it closes the drawer */}
       {sidebarOpen && (
         <div
           onClick={toggleSidebar}
-          className="fixed inset-0 bg-black/60 z-20 md:hidden"
+          className="fixed inset-0 z-20 bg-black/60 backdrop-blur-sm md:hidden"
         />
       )}
 
-      {/* On mobile: fixed off-canvas drawer, toggled by translate-x.
-          On desktop (md+): md:static + md:translate-x-0 forces it always visible,
-          regardless of sidebarOpen state. */}
+      {/* Mobile: off-canvas drawer. Desktop (md+): always visible. */}
       <div
-        className={`fixed md:static z-30 h-full transition-transform duration-200
-        ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0`}
+        className={`fixed z-30 h-full transition-transform duration-200 md:static md:translate-x-0 ${
+          sidebarOpen ? 'translate-x-0 shadow-pop' : '-translate-x-full'
+        }`}
       >
         <Sidebar />
       </div>
 
-      <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+      <div className="ambient-bg flex min-w-0 flex-1 flex-col overflow-hidden">
         <MobileTopBar />
-        <main className="flex-1 flex flex-col overflow-hidden">{children}</main>
+        <main className="flex flex-1 flex-col overflow-hidden">{children}</main>
       </div>
 
       <ActivityPanel />

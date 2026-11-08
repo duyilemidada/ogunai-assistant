@@ -12,7 +12,11 @@ export default function ChatPage() {
 
   return (
     <Layout>
-      <MessageList messages={messages} isSending={isStreaming} />
+      <MessageList
+        messages={messages}
+        isSending={isStreaming}
+        onQuickReply={send}
+      />
       <ChatInput onSend={send} onCancel={cancel} disabled={isStreaming} />
     </Layout>
   )

@@ -37,6 +37,7 @@ Two protections for a flaky or metered connection:
 - cache: identical queries within CACHE_TTL_SECONDS are answered locally,
   which saves quota and survives a retry after a connection drop.
 """
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -158,7 +159,69 @@ def reset_state() -> None:
         _cache.clear()
 
 
-def search(query: str, max_results: int = 5) -> Dict[str, Any]:
+# ── Privacy: scrub secrets and personal numbers BEFORE a query leaves the machine ──
+# Whichever provider answers (Tavily, DuckDuckGo, a SearXNG you do not control) sees
+# the query text. The security prompt tells the model not to put secrets in queries,
+# but a prompt is a request, not a guarantee, so this enforces it in code.
+
+def _luhn_ok(digits: str) -> bool:
+    total, alt = 0, False
+    for ch in reversed(digits):
+        d = int(ch)
+        if alt:
+            d = d * 2 - 9 if d > 4 else d * 2
+        total += d
+        alt = not alt
+    return total % 10 == 0
+
+
+_PATTERNS = [
+    ("api_key", re.compile(r"\b(?:sk|gsk|pk|rk|tvly|xox[abprs]|ghp|gho|ghs|github_pat)[-_][A-Za-z0-9_\-]{10,}")),
+    ("aws_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("jwt", re.compile(r"\beyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]{5,}")),
+    ("bearer_token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{16,}")),
+    ("secret_assignment", re.compile(r"(?i)\b[a-z0-9_]*(?:key|secret|token|password|passwd)[a-z0-9_]*\s*=\s*\S+")),
+    ("secret_assignment", re.compile(r"\b[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD)[A-Z0-9_]*\s*:\s*\S+")),
+    ("email", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b")),
+    ("phone_number", re.compile(r"(?<!\d)(?:\+?234|0)[789][01]\d{8}(?!\d)")),
+]
+_CARD = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_ACCOUNT = re.compile(r"(?<!\d)\d{10,11}(?!\d)")          # NUBAN account (10), BVN / NIN (11)
+_LONG_TOKEN = re.compile(r"\b[A-Za-z0-9_]{32,}\b")
+
+
+def scrub_query(query: str):
+    """Returns (clean_query, [kinds redacted]). Ordinary queries pass through unchanged."""
+    kinds: List[str] = []
+    out = query
+    for kind, pat in _PATTERNS:
+        out, n = pat.subn(f"[REDACTED:{kind}]", out)
+        kinds += [kind] * n
+
+    def card(m):
+        digits = re.sub(r"\D", "", m.group())
+        if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+            kinds.append("card_number")
+            return "[REDACTED:card_number]"
+        return m.group()
+
+    out = _CARD.sub(card, out)
+    out, n = _ACCOUNT.subn("[REDACTED:account_number]", out)
+    kinds += ["account_number"] * n
+
+    def token(m):
+        t = m.group()
+        public_hash = len(t) in (40, 64) and re.fullmatch(r"[0-9a-fA-F]+", t)   # git SHA-1 / SHA-256 are public
+        if re.search(r"\d", t) and re.search(r"[A-Za-z]", t) and not public_hash:
+            kinds.append("token")
+            return "[REDACTED:token]"
+        return t
+
+    out = _LONG_TOKEN.sub(token, out)
+    return out, kinds
+
+
+def _search_clean(query: str, max_results: int = 5) -> Dict[str, Any]:
     query = (query or "").strip()
     if not query:
         return {"error": "Empty search query."}
@@ -211,3 +274,14 @@ def search(query: str, max_results: int = 5) -> Dict[str, Any]:
     if not problems:
         return {"error": "No search provider is configured. Set TAVILY_API_KEY or SEARXNG_URL in .env, or pip install ddgs."}
     return {"error": "Search failed on every provider. " + "; ".join(problems)}
+
+
+def search(query: str, max_results: int = 5) -> Dict[str, Any]:
+    """Scrubs the query, then runs the provider chain. See the module docstring."""
+    clean, redacted = scrub_query(query or "")
+    if redacted and not re.sub(r"\[REDACTED:[a-z_]+\]|\W", "", clean):
+        return {"error": "The query contained only sensitive data (keys, account numbers, etc.), so it was not sent."}
+    result = _search_clean(clean, max_results)
+    if redacted:
+        result = dict(result, redacted=sorted(set(redacted)))
+    return result

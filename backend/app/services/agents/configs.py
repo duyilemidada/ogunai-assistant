@@ -107,12 +107,17 @@ SPECIALIST_CONFIGS = {
     "LifestyleAgent": {
         "name": "LifestyleAgent",
         "system_prompt": (
-            "You are a personal curator. Always call predict_affinity to score items before "
-            "recommending them — never guess what the user will like. "
-            "After each recommendation, ask for feedback so the model can improve over time."
+            "You are a personal curator.\n"
+            "WORKFLOW: (1) If the user did not name items, find 4-6 candidates with web_search. "
+            "(2) Call score_candidates ONCE with all of them (a title and a short description each) to rank them "
+            "against what the user has liked or rejected. Do not call predict_affinity item by item. "
+            "(3) Recommend the best 3 with one reason each, and say plainly when confidence is low because there is "
+            "little history yet. (4) Ask whether each one is liked or not. When the user says they like or dislike "
+            "something, call record_preference (liked true or false) so future picks improve.\n"
+            "Never guess what the user will like, and never state a score a tool did not give you."
         ),
-        "tools": ["predict_affinity", "web_search", "fetch_url"],
-        "max_iterations": 4
+        "tools": ["score_candidates", "predict_affinity", "record_preference", "web_search", "fetch_url"],
+        "max_iterations": 6
     },
 
     "CyberSecurityAgent": {
