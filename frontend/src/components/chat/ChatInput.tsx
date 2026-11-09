@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import type { KeyboardEvent, ChangeEvent } from 'react'
 import FileUploadButton from './FileUploadButton'
 import AttachedDocumentChip from './AttachedDocumentChip'
@@ -20,6 +20,15 @@ export default function ChatInput({
   disabled,
 }: ChatInputProps) {
   const [value, setValue] = useState('')
+  const [stopping, setStopping] = useState(false)
+  useEffect(() => {
+    if (!disabled) setStopping(false)
+  }, [disabled])
+  const handleStop = () => {
+    if (stopping) return
+    setStopping(true)
+    onCancel?.()
+  }
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const canSend = value.trim().length > 0
@@ -96,8 +105,15 @@ export default function ChatInput({
             className="max-h-44 flex-1 resize-none bg-transparent py-1.5 text-[15px] leading-relaxed text-text-primary outline-none placeholder:text-text-dim disabled:opacity-50"
           />
           <button
-            onClick={disabled ? onCancel : handleSend}
-            disabled={disabled ? !onCancel : !canSend}
+            onClick={disabled ? handleStop : handleSend}
+            disabled={disabled ? !onCancel || stopping : !canSend}
+            title={
+              stopping
+                ? 'Stopping…'
+                : disabled
+                  ? 'Stop generating'
+                  : 'Send (Enter)'
+            }
             className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition active:scale-95 ${
               disabled
                 ? 'bg-text-primary text-bg-base hover:opacity-90'
@@ -106,17 +122,30 @@ export default function ChatInput({
                   : 'bg-bg-elevated text-text-dim'
             }`}
             aria-label={disabled ? 'Stop' : 'Send message'}
-            title={disabled ? 'Stop generating' : 'Send (Enter)'}
           >
             {disabled ? (
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="currentColor"
-              >
-                <rect x="4" y="4" width="16" height="16" rx="2" />
-              </svg>
+              stopping ? (
+                <svg
+                  className="animate-spin"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                >
+                  <path d="M12 3a9 9 0 1 0 9 9" strokeLinecap="round" />
+                </svg>
+              ) : (
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                >
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                </svg>
+              )
             ) : (
               <svg
                 width="16"

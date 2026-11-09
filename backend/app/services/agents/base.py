@@ -17,6 +17,19 @@ MAX_HISTORY      = 20
 MAX_RESULT_CHARS = 2000
 STOPPED_TEXT     = "Stopped."
 
+# Search results and page text are what research is made of; 2,000 characters cut
+# them off mid-way. Other tools keep the small default.
+RESULT_LIMITS = {"web_search": 4500, "fetch_url": 5000, "ask_document": 4000}
+# To keep the prompt small, only the newest tool results stay in full.
+KEEP_FULL_TOOL_RESULTS = 3
+OLD_RESULT_CHARS       = 1200
+
+FINAL_ANSWER_NUDGE = (
+    "STEP LIMIT REACHED. Do not call any more tools. Write your final answer now using only what you "
+    "have already gathered. Say what is confirmed (with source URLs), what is unconfirmed, and what you "
+    "could not verify or read."
+)
+
 
 class OgunAIAgent:
     def __init__(
@@ -56,6 +69,15 @@ class OgunAIAgent:
         while tail and tail[0].get("role") == "tool":
             tail = tail[1:]
         self.history = [system] + tail
+
+    def _compact_old_tool_results(self):
+        """Shorten all but the newest tool results; the model has already used them."""
+        idxs = [i for i, m in enumerate(self.history) if m.get("role") == "tool"]
+        for i in idxs[:-KEEP_FULL_TOOL_RESULTS]:
+            c = self.history[i].get("content") or ""
+            if len(c) > OLD_RESULT_CHARS + 80 and "[older result shortened]" not in c:
+                self.history[i] = {**self.history[i],
+                                   "content": c[:OLD_RESULT_CHARS] + "\n... [older result shortened]\n</tool_result>"}
 
     def _recent_context_for_handoff(self, max_messages: int = 4, max_chars_each: int = 1200) -> str:
         """
@@ -151,6 +173,7 @@ class OgunAIAgent:
                 if is_cancelled():
                     return self._stopped()
                 self._trim_history()
+                self._compact_old_tool_results()
                 print(f"[{self.role_config['name']}] Iteration {i+1}/{max_iter}")
 
                 emit_event("thinking", {
@@ -159,6 +182,11 @@ class OgunAIAgent:
                     "max_iterations": max_iter,
                 })
 
+                # Last step: tools off and a nudge to ANSWER. Before this, hitting the limit
+                # returned a generic failure message and threw away everything gathered.
+                if i == max_iter - 1 and max_iter >= 3:
+                    self.history.append({"role": "user", "content": FINAL_ANSWER_NUDGE})
+                    force_text_only_next = True
                 tools_for_this_call = [] if force_text_only_next else tools
                 force_text_only_next = False
 
@@ -240,7 +268,7 @@ class OgunAIAgent:
                         "role":         "tool",
                         "tool_call_id": tc["id"],
                         "name":         tc["name"],
-                        "content":      render_tool_result(tc["name"], result, MAX_RESULT_CHARS),
+                        "content":      render_tool_result(tc["name"], result, RESULT_LIMITS.get(tc["name"], MAX_RESULT_CHARS)),
                     })
                     if self.conversation_id:
                         self._log_episode(tc["name"], tc["arguments"], result, reasoning=text_response)

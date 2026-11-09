@@ -23,7 +23,9 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             from openai import OpenAI
             self._client = OpenAI(
                 base_url=settings.LLM_BASE_URL,
-                api_key=settings.LLM_API_KEY
+                api_key=settings.LLM_API_KEY,
+                timeout=45,        # seconds per request; the default is 600
+                max_retries=1,
             )
             self.model = settings.LLM_MODEL
         except ImportError:

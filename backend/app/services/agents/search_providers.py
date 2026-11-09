@@ -254,6 +254,7 @@ def _search_clean(query: str, max_results: int = 5) -> Dict[str, Any]:
             continue
 
         if results:
+            print(f"  [SEARCH] answered by {name}")
             payload = {"results": results, "provider": name}
             with _lock:
                 if len(_cache) >= CACHE_MAX_ENTRIES:

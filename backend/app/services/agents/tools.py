@@ -10,6 +10,7 @@ import shlex
 import signal
 import types as _types
 import typing
+import urllib.parse
 import subprocess
 import threading
 import time
@@ -777,41 +778,94 @@ def _compress_github_list(endpoint: str, items: list) -> list:
 
     return [fn(item) for item in items[:30]]  # cap at 30 items
 
+_NOISE_BLOCKS = re.compile(r"<(script|style|noscript|svg|nav|header|footer|aside|form|iframe)\b[^>]*>.*?</\1>", re.I | re.S)
+_FETCH_LIMIT = 8000
+
+
+def _fetch_headers() -> Dict[str, str]:
+    contact = getattr(settings, "FETCH_CONTACT", "") or ""      # optional: an email or URL; Wikipedia asks for one
+    ua = "Mozilla/5.0 (compatible; OgunAI/1.0; personal research assistant" + (f"; {contact}" if contact else "") + ")"
+    return {"User-Agent": ua, "Accept": "text/html,application/json;q=0.9,*/*;q=0.8"}
+
+
+def _html_to_main_text(html: str) -> str:
+    """
+    The article text without menus, footers and link lists. The old version
+    converted the WHOLE page, so the first 2,000 characters the model saw were
+    navigation ("Skip to content ... British Broadcasting Corporation ...").
+    Uses trafilatura if installed (pip install trafilatura), else strips the
+    page furniture itself.
+    """
+    cleaned = _NOISE_BLOCKS.sub(" ", html)       # menus, footers, scripts out first
+    try:
+        import trafilatura
+        text = trafilatura.extract(cleaned, include_comments=False, include_links=False, include_tables=True)
+        if text and len(text) > 300:
+            return text.strip()
+    except Exception:
+        pass
+    try:
+        import html2text
+        h = html2text.HTML2Text()
+        h.ignore_links = True       # link URLs were most of the noise
+        h.ignore_images = True
+        h.body_width = 0
+        text = h.handle(cleaned)
+    except ImportError:
+        text = re.sub(r"<[^>]+>", " ", cleaned)
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip()
+
+
+def _wikipedia_text(url: str) -> Optional[Dict[str, Any]]:
+    """Wikipedia blocks plain page scrapes (403); its own API is the supported way to read an article."""
+    m = re.match(r"https?://([a-z\-]+)\.wikipedia\.org/wiki/([^#?]+)", url)
+    if not m:
+        return None
+    lang, title = m.groups()
+    resp = httpx.get(
+        f"https://{lang}.wikipedia.org/w/api.php",
+        params={"action": "query", "prop": "extracts", "explaintext": 1, "format": "json",
+                "redirects": 1, "titles": urllib.parse.unquote(title)},
+        headers=_fetch_headers(), follow_redirects=True, timeout=15,
+    )
+    resp.raise_for_status()
+    page = next(iter(resp.json().get("query", {}).get("pages", {}).values()), {})
+    text = (page.get("extract") or "").strip()
+    if not text:
+        return None
+    return {"url": url, "status_code": resp.status_code, "content": text[:_FETCH_LIMIT],
+            "truncated": len(text) > _FETCH_LIMIT, "source": "Wikipedia API"}
+
+
 @register_tool("fetch_url")
 def fetch_url(url: str) -> Dict[str, Any]:
     """
-    Fetches a URL and returns its content as clean text.
+    Fetches a URL and returns its main text content.
     Use for static pages, documentation, and APIs. For JS-heavy pages, use browse_js instead.
     """
     try:
-        resp = httpx.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; OgunAI/1.0)"},
-            follow_redirects=True,
-            timeout=15
-        )
+        wiki = _wikipedia_text(url)
+        if wiki:
+            return wiki
+    except Exception:
+        pass                                   # fall through to a normal fetch
+    try:
+        resp = httpx.get(url, headers=_fetch_headers(), follow_redirects=True, timeout=15)
         resp.raise_for_status()
-
-        try:
-            import html2text
-            h = html2text.HTML2Text()
-            h.ignore_links = False
-            h.ignore_images = True
-            h.body_width = 0    # No line wrapping
-            text = h.handle(resp.text)
-        except ImportError:
-            # Fallback: strip HTML tags with regex
-            text = re.sub(r'<[^>]+>', ' ', resp.text)
-            text = re.sub(r'\s+', ' ', text).strip()
-
+        is_html = "html" in resp.headers.get("content-type", "") or "<html" in resp.text[:500].lower()
+        text = _html_to_main_text(resp.text) if is_html else resp.text.strip()
         return {
             "url": str(resp.url),
             "status_code": resp.status_code,
-            "content": text[:10000],
-            "truncated": len(text) > 10000
+            "content": text[:_FETCH_LIMIT],
+            "truncated": len(text) > _FETCH_LIMIT
         }
     except httpx.HTTPStatusError as e:
-        return {"error": f"HTTP {e.response.status_code} fetching {url}"}
+        code = e.response.status_code
+        hint = (" This site blocks automated readers or needs a login. Do NOT retry it: "
+                "use the search snippets or a different source.") if code in (401, 402, 403, 429) else ""
+        return {"error": f"HTTP {code} fetching {url}.{hint}"}
     except Exception as e:
         return {"error": str(e)}
 
